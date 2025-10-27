@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes"?><rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom"><channel><title>Homes on Meirong Dev Slides</title><link>https://meirongdev.github.io/slides/home/</link><description>Recent content in Homes on Meirong Dev Slides</description><generator>Hugo</generator><language>en-us</language><atom:link href="https://meirongdev.github.io/slides/home/index.xml" rel="self" type="application/rss+xml"/><item><title>Meirong's Presentation</title><link>https://meirongdev.github.io/slides/home/list/</link><pubDate>Mon, 01 Jan 0001 00:00:00 +0000</pubDate><guid>https://meirongdev.github.io/slides/home/list/</guid><description>&lt;h2 id="spring-boot"&gt;Spring Boot&lt;/h2&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;a href="https://meirongdev.github.io/slides/springbootactuator/"&gt;Spring Boot Actuator&lt;/a&gt;&lt;/li&gt;
+&lt;/ul&gt;
+&lt;hr&gt;
+&lt;h2 id="kubernetes"&gt;Kubernetes&lt;/h2&gt;
+&lt;ul&gt;
+&lt;li&gt;Rolling Updates with Zero Downtime(Spring Boot)&lt;/li&gt;
+&lt;/ul&gt;
+&lt;hr&gt;
+&lt;h2 id="service-mesh"&gt;Service Mesh&lt;/h2&gt;
+&lt;ul&gt;
+&lt;li&gt;Canary Deployments with Istio(ambient)&lt;/li&gt;
+&lt;/ul&gt;</description></item></channel></rss>
