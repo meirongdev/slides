@@ -10,5 +10,5 @@
 &lt;hr&gt;
 &lt;h2 id="service-mesh"&gt;Service Mesh&lt;/h2&gt;
 &lt;ul&gt;
-&lt;li&gt;Canary Deployments with Istio(ambient)&lt;/li&gt;
+&lt;li&gt;Canary Deployments with Istio(ambient) + Argo Rollout&lt;/li&gt;
 &lt;/ul&gt;</description></item></channel></rss>
