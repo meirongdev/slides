@@ -2,6 +2,13 @@
 &lt;ul&gt;
 &lt;li&gt;&lt;a href="https://meirongdev.github.io/slides/springbootactuator/"&gt;Spring Boot Actuator&lt;/a&gt;&lt;/li&gt;
 &lt;/ul&gt;
+&lt;p&gt;&amp;ndash;&lt;/p&gt;
+&lt;h2 id="observability"&gt;Observability&lt;/h2&gt;
+&lt;ul&gt;
+&lt;li&gt;Logging&lt;/li&gt;
+&lt;li&gt;Monitoring with Prometheus &amp;amp; Grafana(Spring Boot)&lt;/li&gt;
+&lt;li&gt;Tracing with Jaeger(Spring Boot)&lt;/li&gt;
+&lt;/ul&gt;
 &lt;hr&gt;
 &lt;h2 id="kubernetes"&gt;Kubernetes&lt;/h2&gt;
 &lt;ul&gt;
