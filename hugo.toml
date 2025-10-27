@@ -1,4 +1,4 @@
-# baseURL = 'https://example.org/'
+baseURL = "https://meirongdev.github.io/slides/"
 languageCode = 'en-us'
 title = 'Meirong Dev Slides'
 
