@@ -1,9 +1,13 @@
 +++
 title = "Spring Boot Actuator"
+weight = 10
 outputs = ["Reveal"]
 +++
+{{% section %}}
 
-[Enabling Production-ready Features](https://docs.spring.io/spring-boot/reference/actuator/enabling.html)
+## [Enabling Production-ready Features](https://docs.spring.io/spring-boot/reference/actuator/enabling.html)
+
+---
 
 ```xml
 <dependencies>
@@ -13,7 +17,11 @@ outputs = ["Reveal"]
 	</dependency>
 </dependencies>
 ```
+
+---
+
 access: `/actuator` endpoint
+
 ```json
 {
   "_links": {
@@ -32,15 +40,4 @@ access: `/actuator` endpoint
   }
 }
 ```
-
----
-
-{{% section %}}
-
-### Vertical slide 1
-
----
-
-### Vertical slide 2
-
 {{% /section %}}

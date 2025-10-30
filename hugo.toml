@@ -12,3 +12,6 @@ baseName = "index"
 mediaType = "text/html"
 isHTML = true
 
+[params.reveal_hugo]
+custom_css = "css/custom.css"
+

@@ -12,4 +12,4 @@ hugo server
 
 ## Slides
 
-- [Spring Boot Actuator](http://localhost:1313/slides/springbootactuator/)
+- [Spring Boot Actuator](https://meirongdev.github.io/slides/springbootactuator/#/)
