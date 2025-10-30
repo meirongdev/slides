@@ -1,9 +1,10 @@
 +++
-title = "Spring Boot Actuator"
+title = "Actuator Takeaways"
 outputs = ["Reveal"]
+weight = 190
 +++
 
-## Spring Boot Actuator
+## Thank You!
 
 <div style="display: flex; justify-content: center; gap: 20px;">
   <div>
