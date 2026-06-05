@@ -13,3 +13,4 @@ hugo server
 ## Slides
 
 - [Spring Boot Actuator](https://meirongdev.github.io/slides/springbootactuator/#/)
+- [Guardrails in Practice](https://meirongdev.github.io/slides/guardrails/#/)

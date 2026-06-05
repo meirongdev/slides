@@ -1,0 +1,7 @@
+/*
+ * Site-wide custom styles. Referenced by hugo.toml
+ * (params.reveal_hugo.custom_css = "css/custom.css") and loaded on every deck.
+ *
+ * Per-deck overrides live in layouts/partials/<section>/reveal-hugo/head.html
+ * (e.g. the guardrails deck shrinks dense slides there).
+ */

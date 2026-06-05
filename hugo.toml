@@ -1,5 +1,5 @@
 baseURL = "https://meirongdev.github.io/slides/"
-languageCode = 'en-us'
+locale = 'en-US'
 title = 'Meirong Dev Slides'
 
 theme = ["github.com/joshed-io/reveal-hugo"]

@@ -27,3 +27,9 @@ outputs = ["Reveal"]
 ## Service Mesh
 
 - Canary Deployments with Istio(ambient) + Argo Rollout
+
+---
+
+## Engineering Practices
+
+- [Guardrails in Practice](/slides/guardrails/)
