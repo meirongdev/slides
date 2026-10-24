@@ -33,3 +33,9 @@ outputs = ["Reveal"]
 ## Engineering Practices
 
 - [Guardrails in Practice](/slides/guardrails/)
+
+---
+
+## Database
+
+- [ClickHouse 原理与交易明细链路](/slides/clickhouse/)

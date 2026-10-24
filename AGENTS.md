@@ -39,6 +39,10 @@ The theme is a **Hugo Module** declared in `go.mod`, not a git submodule — `th
 2. Add `NN-name.md` files, each with `outputs = ["Reveal"]` and an ascending `weight`.
 3. Link it from the relevant list (e.g. `content/home/list.md`) and the `README.md` Slides section.
 
+## Prebuilt decks under `static/`
+
+`static/clickhouse/index.html` is a standalone reveal.js page that Hugo copies as-is; reveal-hugo never touches it. It is generated from a Claude Slides deck whose source lives in the blog repo (`meirongdev/blog`, `docs/decks/clickhouse-team-deck/`). Do not hand-edit it: change the source there and regenerate with that directory's `build-reveal.py`.
+
 ## Styling & per-deck overrides
 
 - **Site-wide CSS:** `static/css/custom.css` (wired via `custom_css` in `hugo.toml`) loads on every deck.

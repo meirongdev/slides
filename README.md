@@ -14,3 +14,4 @@ hugo server
 
 - [Spring Boot Actuator](https://meirongdev.github.io/slides/springbootactuator/#/)
 - [Guardrails in Practice](https://meirongdev.github.io/slides/guardrails/#/)
+- [ClickHouse 原理与交易明细链路](https://meirongdev.github.io/slides/clickhouse/)
