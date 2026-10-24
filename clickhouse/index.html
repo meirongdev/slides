@@ -1,0 +1,738 @@
+<!doctype html>
+<!-- 由 meirongdev/blog 的 docs/decks/clickhouse-team-deck/build-reveal.py 生成，改内容去改那边的 project/，再重新生成 -->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ClickHouse 原理与交易明细链路</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/5.1.0/reveal.min.css">
+<style>
+.reveal .slides { text-align: left; }
+.reveal .slides > section { box-sizing: border-box; width: 1920px; height: 1080px; }
+.reveal .slides *, .reveal .slides *::before, .reveal .slides *::after { box-sizing: border-box; margin: 0; }
+.reveal .slides div { min-width: 0; }
+.reveal .slides div:not([style*="display:"]) { display: flex; flex-direction: column; }
+.reveal .slides :is(h1, h2, h3, p, li, td, th) { overflow-wrap: anywhere; }
+.reveal .slides h1 { font-size: 96px; font-weight: 600; line-height: 1.1; }
+.reveal .slides h2 { font-size: 64px; font-weight: 600; line-height: 1.15; }
+.reveal .slides h3 { font-size: 44px; font-weight: 600; line-height: 1.2; }
+.reveal .slides p { font-size: 32px; line-height: 1.4; }
+.reveal .slides table { border-collapse: collapse; }
+.reveal .slides :is(td, th) { padding: 0.35em 0.6em; text-align: left; vertical-align: top; border: 1px solid #D9D3C4; }
+x-shape { display: block; flex: none; }
+x-shape[kind="arrow-right"] { clip-path: polygon(0 30%, 60% 30%, 60% 0, 100% 50%, 60% 100%, 60% 70%, 0 70%); }
+x-shape[kind="arrow-down"] { clip-path: polygon(30% 0, 70% 0, 70% 60%, 100% 60%, 50% 100%, 0 60%, 30% 60%); }
+x-connector { display: none; }
+</style>
+</head>
+<body>
+<div class="reveal"><div class="slides">
+<section id="cover" data-transition="fade" style="background:#0F1B2D;color:#F2EFE7;font-family:'Noto Sans SC', Arial, sans-serif;padding:128px 128px 160px;display:flex;flex-direction:column;justify-content:space-between;gap:48px">
+<p style="font-size:24px;font-weight:700;letter-spacing:4px;color:#E8A33D">团队分享 · 交易明细数据链路</p>
+<div style="display:flex;flex-direction:column;gap:36px;width:1500px">
+<h1 style="font-size:104px;font-weight:700;line-height:1.15">ClickHouse 原理与<br>交易明细链路</h1>
+<p style="font-size:36px;line-height:1.5;color:#C9D3DF">从一条 INSERT 到一张报表：part 和 merge、Kafka sink 的至少一次写入、物化视图聚合，以及运维会碰到的几类问题</p>
+</div>
+<div style="display:flex;gap:24px;align-items:center">
+<p style="font-size:24px;color:#F2EFE7;background:#17273D;border:1px solid #2C3E57;border-radius:999px;padding:12px 28px">单日一千多万到三亿多行</p>
+<p style="font-size:24px;color:#F2EFE7;background:#17273D;border:1px solid #2C3E57;border-radius:999px;padding:12px 28px">ClickHouse 25.3，1 shard × 3 replicas</p>
+<p style="font-size:24px;color:#F2EFE7;background:#17273D;border:1px solid #2C3E57;border-radius:999px;padding:12px 28px">Kafka Connect sink 至少一次写入</p>
+</div>
+<p style="position:absolute;left:128px;bottom:64px;width:1664px;font-size:24px;color:#8FA0B3">素材来自博客的 ClickHouse 系列和 clickhouse-lab（25.3.14.14 三副本实验台）。标「方案」的内容在 lab 上验过，还没在现有集群上执行。</p>
+<aside class="notes">开场：这次分享分四块。先讲 ClickHouse 怎么存、怎么查，这是后面所有问题的根；再讲 Kafka sink 怎么把一天两三亿行写进来、重复行从哪来；然后是报表怎么用物化视图增量聚合；最后是运维会碰到的几类问题怎么处理。全程分清两类内容：这套系统现在的做法，和在 lab 上验过、还没上线的方案。</aside>
+</section>
+<section id="architecture" data-transition="fade" style="background:#F6F4EE;color:#1A2433;font-family:'Noto Sans SC', Arial, sans-serif;padding:128px 128px 160px;display:flex;flex-direction:column;gap:28px">
+<h2 style="font-size:60px;font-weight:700;line-height:1.15">这套系统长什么样</h2>
+<div style="display:flex;gap:20px">
+<div style="flex:1;background:#FDFCF9;border:1px solid #D9D3C4;border-radius:16px;padding:28px;display:flex;flex-direction:column;gap:10px">
+<h3 style="font-size:32px;font-weight:600;line-height:1.3">Kafka</h3>
+<p style="font-size:24px;line-height:1.45;color:#3B4656">单 topic，8 个分区；峰值每秒约 1 万条。producer 重试时可能把同一条存成两份。</p>
+</div>
+<x-shape kind="arrow-right" style="width:56px;height:28px;background:#E8A33D;align-self:center"></x-shape>
+<div style="flex:1;background:#FDFCF9;border:1px solid #D9D3C4;border-radius:16px;padding:28px;display:flex;flex-direction:column;gap:10px">
+<h3 style="font-size:32px;font-weight:600;line-height:1.3">ClickHouse sink</h3>
+<p style="font-size:24px;line-height:1.45;color:#3B4656">clickhouse-kafka-connect v1.3.9，Confluent Cloud 托管。每次 poll 按分区各发一条带 token 的 INSERT；至少一次投递，没开 exactlyOnce。</p>
+</div>
+<x-shape kind="arrow-right" style="width:56px;height:28px;background:#E8A33D;align-self:center"></x-shape>
+<div style="flex:1;background:#FDFCF9;border:1px solid #D9D3C4;border-radius:16px;padding:28px;display:flex;flex-direction:column;gap:10px">
+<h3 style="font-size:32px;font-weight:600;line-height:1.3">明细表</h3>
+<p style="font-size:24px;line-height:1.45;color:#3B4656">ReplicatedMergeTree，按结算日分区，ORDER BY (settle_ms, id, rev)；34 列、8 个跳数索引。单日一千多万到三亿多行。</p>
+</div>
+<x-shape kind="arrow-right" style="width:56px;height:28px;background:#E8A33D;align-self:center"></x-shape>
+<div style="flex:1;background:#FDFCF9;border:1px solid #D9D3C4;border-radius:16px;padding:28px;display:flex;flex-direction:column;gap:10px">
+<div style="display:flex;gap:12px;align-items:center">
+<h3 style="font-size:32px;font-weight:600;line-height:1.3">报表表</h3>
+<p style="font-size:24px;font-weight:700;color:#F2EFE7;background:#1F6E9C;border-radius:999px;padding:2px 14px">方案</p>
+</div>
+<p style="font-size:24px;line-height:1.45;color:#3B4656">物化视图在明细插入时触发，聚合进 UTC 半小时桶，按天分区；日报、周报、月报按时区在查询时上卷。</p>
+</div>
+</div>
+<div style="display:flex;gap:24px">
+<div style="flex:1;background:#ECE8DD;border-radius:16px;padding:24px 28px;display:flex;flex-direction:column;gap:8px">
+<h3 style="font-size:28px;font-weight:600;line-height:1.3">Keeper</h3>
+<p style="font-size:24px;line-height:1.45;color:#3B4656">存复制日志、块号分配和块级去重标记。Aiven 在每个节点同机跑一个 ZooKeeper，运维碰不到这一层。</p>
+</div>
+<div style="flex:1;background:#ECE8DD;border-radius:16px;padding:24px 28px;display:flex;flex-direction:column;gap:8px">
+<h3 style="font-size:28px;font-weight:600;line-height:1.3">对象存储</h3>
+<p style="font-size:24px;line-height:1.45;color:#3B4656">tiered storage：create_time 满 45 天的 part 整个搬过去。B 档约三分之二、C 档近九成的数据已经在上面。</p>
+</div>
+<div style="flex:1;background:#ECE8DD;border-radius:16px;padding:24px 28px;display:flex;flex-direction:column;gap:8px">
+<h3 style="font-size:28px;font-weight:600;line-height:1.3">两类下游</h3>
+<p style="font-size:24px;line-height:1.45;color:#3B4656">backoffice 按时间范围查明细、做对账，读明细表；按不同时区出日报、周报、月报，读报表表。</p>
+</div>
+</div>
+<p style="font-size:24px;line-height:1.5;color:#3B4656">按 region 分成几套独立部署，ClickHouse 是 Aiven 托管的 25.3，1 shard × 3 replicas，任一节点都能接写入。三档规格（每个节点 / 单日分区）：A business-16，4 vCPU / 16 GB，一千多万行；B business-32，8 vCPU / 32 GB，约两亿行；C business-64，16 vCPU / 64 GB，三亿多行。</p>
+<p style="position:absolute;left:128px;bottom:64px;font-size:24px;color:#6B7480">系统概览 · 出处：ClickHouse 交易明细系统的整体架构</p>
+<p style="position:absolute;right:128px;bottom:64px;width:120px;text-align:right;font-size:24px;color:#6B7480">02</p>
+<aside class="notes">上面一行是数据流：业务服务写 Kafka，托管 sink 消费后写进三副本 ClickHouse，报表那一段是方案。下面一行是三样绕不开的东西：Keeper 管所有复制表的协调，对象存储管冷数据，下游只有明细查询和报表两类。三档部署的数据量差 30 倍，后面讲去重窗口时会用到 B 档和 C 档的建块速率。</aside>
+</section>
+<section id="write-path" data-transition="fade" style="background:#F6F4EE;color:#1A2433;font-family:'Noto Sans SC', Arial, sans-serif;padding:128px 128px 160px;display:flex;flex-direction:column;gap:28px">
+<h2 style="font-size:60px;font-weight:700;line-height:1.15">一条 INSERT 怎么变成 part</h2>
+<div style="display:flex;gap:40px">
+<div style="flex:1;display:flex;flex-direction:column;gap:24px">
+<div style="display:flex;flex-direction:column;gap:10px">
+<div style="display:flex;gap:20px;align-items:center;background:#FDFCF9;border:1px solid #D9D3C4;border-radius:12px;padding:18px 28px">
+<p style="font-size:30px;font-weight:700;color:#9A6212;width:40px">1</p>
+<p style="font-size:26px;line-height:1.45">服务端按分区键把这批行拆开，每个分区单独成一块</p>
+</div>
+<x-shape kind="arrow-down" style="width:22px;height:32px;background:#E8A33D;align-self:center"></x-shape>
+<div style="display:flex;gap:20px;align-items:center;background:#FDFCF9;border:1px solid #D9D3C4;border-radius:12px;padding:18px 28px">
+<p style="font-size:30px;font-weight:700;color:#9A6212;width:40px">2</p>
+<p style="font-size:26px;line-height:1.45">每块按排序键排序、拆成列、逐列压缩（默认 LZ4，约 1 MB 一个压缩块）</p>
+</div>
+<x-shape kind="arrow-down" style="width:22px;height:32px;background:#E8A33D;align-self:center"></x-shape>
+<div style="display:flex;gap:20px;align-items:center;background:#FDFCF9;border:1px solid #D9D3C4;border-radius:12px;padding:18px 28px">
+<p style="font-size:30px;font-weight:700;color:#9A6212;width:40px">3</p>
+<p style="font-size:26px;line-height:1.45">写进一个新目录，这个目录就是 part；稀疏主键索引也写在里面</p>
+</div>
+<x-shape kind="arrow-down" style="width:22px;height:32px;background:#E8A33D;align-self:center"></x-shape>
+<div style="display:flex;gap:20px;align-items:center;background:#FDFCF9;border:1px solid #D9D3C4;border-radius:12px;padding:18px 28px">
+<p style="font-size:30px;font-weight:700;color:#9A6212;width:40px">4</p>
+<p style="font-size:26px;line-height:1.45">复制表提交前去 Keeper 领块号、按哈希或 token 查重、记一条复制日志</p>
+</div>
+</div>
+<div style="background:#0F1B2D;border-radius:12px;padding:24px 28px">
+<p style="font-size:26px;line-height:1.5;color:#F2EFE7"><b>part 写完就不再改。</b>后面的事都从这一条来：重复为什么会直接落库，去重为什么要等合并，改一行为什么要给整个 part 出新版本，修数据为什么按分区整体替换。</p>
+</div>
+</div>
+<div style="width:720px;display:flex;flex-direction:column;gap:20px">
+<div style="background:#0F1B2D;border-radius:16px;padding:28px;display:flex;flex-direction:column;gap:14px">
+<p style="font-size:24px;font-weight:700;color:#E8A33D">lab 上新写的一个 Wide part 目录</p>
+<div style="display:flex;gap:20px"><p style="width:340px;font-family:'JetBrains Mono', 'Courier New', monospace;font-size:24px;line-height:1.4;color:#F2EFE7">20260310_0_0_0/</p><p style="flex:1;font-size:24px;line-height:1.4;color:#C9D3DF">分区 ID、起止块号、合并层级</p></div>
+<div style="display:flex;gap:20px"><p style="width:340px;font-family:'JetBrains Mono', 'Courier New', monospace;font-size:24px;line-height:1.4;color:#F2EFE7">k.bin  k.cmrk2</p><p style="flex:1;font-size:24px;line-height:1.4;color:#C9D3DF">每列一个压缩数据文件，加一个 mark 文件</p></div>
+<div style="display:flex;gap:20px"><p style="width:340px;font-family:'JetBrains Mono', 'Courier New', monospace;font-size:24px;line-height:1.4;color:#F2EFE7">primary.cidx</p><p style="flex:1;font-size:24px;line-height:1.4;color:#C9D3DF">稀疏主键索引，每个 granule（8192 行）一条</p></div>
+<div style="display:flex;gap:20px"><p style="width:340px;font-family:'JetBrains Mono', 'Courier New', monospace;font-size:24px;line-height:1.4;color:#F2EFE7">minmax_d.idx</p><p style="flex:1;font-size:24px;line-height:1.4;color:#C9D3DF">分区列的最小值和最大值</p></div>
+<div style="display:flex;gap:20px"><p style="width:340px;font-family:'JetBrains Mono', 'Courier New', monospace;font-size:24px;line-height:1.4;color:#F2EFE7">count.txt  columns.txt</p><p style="flex:1;font-size:24px;line-height:1.4;color:#C9D3DF">行数、列清单、校验和等元数据</p></div>
+</div>
+<p style="font-size:24px;line-height:1.5;color:#3B4656">sink 每批每个 Kafka 分区一个 part，一条 INSERT 只有十几到几十行。B 档三副本合计每秒约 124 个块、每块约 19 行；C 档每秒约 40 个块、每块约 90 行。</p>
+<p style="font-size:24px;line-height:1.5;color:#3B4656">小于 10 MiB 的 part 用 Compact 存法（所有列放一个文件），sink 写进来的小 part 都是；大的用 Wide（每列一个文件）。</p>
+</div>
+</div>
+<p style="position:absolute;left:128px;bottom:64px;font-size:24px;color:#6B7480">基本原理 · 出处：ClickHouse 的写入路径（clickhouse-lab 实验 01、03、11）</p>
+<p style="position:absolute;right:128px;bottom:64px;width:120px;text-align:right;font-size:24px;color:#6B7480">03</p>
+<aside class="notes">这页只讲一件事：ClickHouse 不原地改数据，每次写入生成一个新的 part，写完不动。目录名四段是分区 ID、起始块号、结束块号、合并层级。要记住的量级：这套系统每秒新建几十到上百个只有十几到几十行的小 part，merge 要合的 part 数、Keeper 要记的块数、去重窗口能盖住多少秒，都跟着块的个数走。</aside>
+</section>
+<section id="merge-parts" data-transition="fade" style="background:#F6F4EE;color:#1A2433;font-family:'Noto Sans SC', Arial, sans-serif;padding:128px 128px 160px;display:flex;flex-direction:column;gap:28px">
+<h2 style="font-size:60px;font-weight:700;line-height:1.15">后台 merge 把小 part 合大，分区是 merge 的边界</h2>
+<div style="display:flex;gap:32px">
+<div style="width:760px;display:flex;flex-direction:column;gap:20px">
+<div style="display:flex;flex-direction:column;gap:16px;align-items:center">
+<div style="width:720px;border:2px dashed #B8AE98;border-radius:16px;padding:20px;display:flex;flex-direction:column;gap:12px">
+<p style="font-size:24px;color:#6B7480">分区 20260310 里刚写进来的 6 个 part（层级 0，块号 0 到 5）</p>
+<div style="display:flex;gap:12px">
+<div style="flex:1;height:56px;background:#E8A33D;border-radius:8px"></div>
+<div style="flex:1;height:56px;background:#E8A33D;border-radius:8px"></div>
+<div style="flex:1;height:56px;background:#E8A33D;border-radius:8px"></div>
+<div style="flex:1;height:56px;background:#E8A33D;border-radius:8px"></div>
+<div style="flex:1;height:56px;background:#E8A33D;border-radius:8px"></div>
+<div style="flex:1;height:56px;background:#E8A33D;border-radius:8px"></div>
+</div>
+</div>
+<x-shape kind="arrow-down" style="width:28px;height:56px;background:#1F6E9C"></x-shape>
+<div style="width:720px;background:#1F6E9C;border-radius:12px;padding:18px 24px">
+<p style="font-size:24px;line-height:1.4;color:#F2EFE7;text-align:center">按排序键归并成一个大 part，层级加 1（例如 20260310_0_5_1）</p>
+</div>
+</div>
+<p style="font-size:24px;line-height:1.5;color:#3B4656">被合掉的 part 标成非活动，默认 8 分钟后删文件；一次最多合 100 个，合到压缩后约 150 GiB 就不再往上合。合并要花 CPU 和磁盘 IO，和查询、写入抢资源。</p>
+<div style="background:#0F1B2D;border-radius:12px;padding:22px 28px">
+<p style="font-size:26px;line-height:1.5;color:#F2EFE7"><b>改数据同样以 part 为单位。</b>mutation 给涉及的 part 出一个新版本：Wide part 只重写改到的列，Compact part 整个重写；键列不能改，没有 UPSERT。</p>
+</div>
+</div>
+<div style="flex:1;display:flex;flex-direction:column;gap:20px">
+<div style="background:#FDFCF9;border:1px solid #D9D3C4;border-radius:16px;padding:24px 28px;display:flex;flex-direction:column;gap:10px">
+<h3 style="font-size:30px;font-weight:600;line-height:1.3">merge 只在同一个分区里做</h3>
+<p style="font-size:24px;line-height:1.45;color:#3B4656">分区键按结算日，一天一个。ATTACH、REPLACE、DROP PARTITION 都以分区为单位，本地盘上只挂硬链接；文档建议分区别超过约一千个。</p>
+</div>
+<div style="background:#FDFCF9;border:1px solid #D9D3C4;border-radius:16px;padding:24px 28px;display:flex;flex-direction:column;gap:10px">
+<h3 style="font-size:30px;font-weight:600;line-height:1.3">merge 跟不上，INSERT 先被拖慢、再被拒</h3>
+<p style="font-size:24px;line-height:1.45;color:#3B4656">单分区活跃 part 到 1000（parts_to_delay_insert）开始拖慢，到 3000（parts_to_throw_insert）报 Too many parts。lab 把阈值压到 20 和 25：先被拖慢 5 次，第 26 条才被拒。中间那段就是预警窗口。</p>
+</div>
+<div style="background:#FDFCF9;border:1px solid #D9D3C4;border-radius:16px;padding:24px 28px;display:flex;flex-direction:column;gap:10px">
+<h3 style="font-size:30px;font-weight:600;line-height:1.3">折叠和聚合都只在 merge 时发生</h3>
+<p style="font-size:24px;line-height:1.45;color:#3B4656">ReplacingMergeTree 把排序键相同的行只留一行，AggregatingMergeTree 把中间状态合成一行，都是合并时才做。没合并到的重复，普通查询照样读得到。</p>
+</div>
+</div>
+</div>
+<p style="position:absolute;left:128px;bottom:64px;font-size:24px;color:#6B7480">基本原理 · 出处：ClickHouse 的写入路径（clickhouse-lab 实验 01、08、11）</p>
+<p style="position:absolute;right:128px;bottom:64px;width:120px;text-align:right;font-size:24px;color:#6B7480">04</p>
+<aside class="notes">这套系统每秒新建一百多个十几行的小 part，全靠 merge 持续合掉；全表有两三千个活跃 part，大部分在历史分区上。容易把 part 数推上去的是人为操作：迁移或实验时停了 merge，或者一条大 INSERT SELECT 一次切出很多 part。右边第三条是后面去重方案和报表的根：ReplacingMergeTree 的折叠只在 merge 时发生，所以读明细要带 FINAL，物化视图也看不到合并。</aside>
+</section>
+<section id="replication" data-transition="fade" style="background:#F6F4EE;color:#1A2433;font-family:'Noto Sans SC', Arial, sans-serif;padding:128px 128px 160px;display:flex;flex-direction:column;gap:24px">
+<h2 style="font-size:60px;font-weight:700;line-height:1.15">三副本多主异步复制，协调全靠 Keeper</h2>
+<div style="position:relative;width:1664px;height:560px">
+<div style="position:absolute;left:656px;top:0px;width:352px;height:120px;background:#0F1B2D;border-radius:16px;padding:18px 24px;display:flex;flex-direction:column;gap:6px">
+<h3 style="font-size:28px;font-weight:600;line-height:1.3;color:#E8A33D">Keeper</h3>
+<p style="font-size:24px;line-height:1.4;color:#F2EFE7">log/ 复制日志 · blocks/ 去重标记 · block_numbers/ 块号</p>
+</div>
+<div style="position:absolute;left:0px;top:260px;width:480px;height:180px;background:#FDFCF9;border:1px solid #D9D3C4;border-radius:16px;padding:20px 24px;display:flex;flex-direction:column;gap:8px">
+<h3 style="font-size:28px;font-weight:600;line-height:1.3">ch1 · 收到 INSERT 的副本</h3>
+<p style="font-size:24px;line-height:1.4;color:#3B4656">写好 part，在 log/ 里记一条；part_log 记 NewPart。默认在这里提交就返回。</p>
+</div>
+<div style="position:absolute;left:592px;top:260px;width:480px;height:180px;background:#FDFCF9;border:1px solid #D9D3C4;border-radius:16px;padding:20px 24px;display:flex;flex-direction:column;gap:8px">
+<h3 style="font-size:28px;font-weight:600;line-height:1.3">ch2</h3>
+<p style="font-size:24px;line-height:1.4;color:#3B4656">把日志拉进自己的 queue，执行 GET_PART 把 part 拉过来；part_log 记 DownloadPart。</p>
+</div>
+<div style="position:absolute;left:1184px;top:260px;width:480px;height:180px;background:#FDFCF9;border:1px solid #D9D3C4;border-radius:16px;padding:20px 24px;display:flex;flex-direction:column;gap:8px">
+<h3 style="font-size:28px;font-weight:600;line-height:1.3">ch3</h3>
+<p style="font-size:24px;line-height:1.4;color:#3B4656">同 ch2。MERGE_PARTS 各自在本地合，REPLACE_RANGE 是换分区。</p>
+</div>
+<x-connector x1="832" y1="120" x2="832" y2="200" head="none" style="color:#1F6E9C;border-width:3px;border-style:dashed"></x-connector>
+<x-connector x1="240" y1="200" x2="1424" y2="200" head="none" style="color:#1F6E9C;border-width:3px;border-style:dashed"></x-connector>
+<x-connector x1="240" y1="200" x2="240" y2="260" head="end" style="color:#1F6E9C;border-width:3px;border-style:dashed"></x-connector>
+<x-connector x1="832" y1="200" x2="832" y2="260" head="end" style="color:#1F6E9C;border-width:3px;border-style:dashed"></x-connector>
+<x-connector x1="1424" y1="200" x2="1424" y2="260" head="end" style="color:#1F6E9C;border-width:3px;border-style:dashed"></x-connector>
+<x-connector x1="240" y1="440" x2="240" y2="500" head="none" style="color:#E8A33D;border-width:3px"></x-connector>
+<x-connector x1="240" y1="500" x2="1424" y2="500" head="none" style="color:#E8A33D;border-width:3px"></x-connector>
+<x-connector x1="832" y1="500" x2="832" y2="440" head="end" style="color:#E8A33D;border-width:3px"></x-connector>
+<x-connector x1="1424" y1="500" x2="1424" y2="440" head="end" style="color:#E8A33D;border-width:3px"></x-connector>
+<p style="position:absolute;left:1040px;top:140px;width:620px;font-size:24px;line-height:1.4;color:#1F6E9C">三个副本各自照着 Keeper 里的复制日志执行（虚线：只传元数据）</p>
+<p style="position:absolute;left:880px;top:516px;width:500px;font-size:24px;line-height:1.4;color:#9A6212">ch2、ch3 各自从 ch1 经 9009 端口拉 part（实线：传数据）</p>
+</div>
+<div style="display:flex;gap:32px">
+<p style="flex:1;font-size:26px;line-height:1.5;color:#3B4656">INSERT 在收到它的那个副本上提交就返回（insert_quorum 默认 0），ALTER 默认只等当前副本做完（alter_sync = 1）。三个副本之间会短暂不一致。</p>
+<p style="flex:1;font-size:26px;line-height:1.5;color:#3B4656">Aiven 的连接随机落到任一节点。所以核对行数、看复制队列、确认 mutation 做完，一律用 clusterAllReplicas 问遍三个副本。</p>
+</div>
+<p style="position:absolute;left:128px;bottom:64px;font-size:24px;color:#6B7480">基本原理 · 出处：ClickHouse 的写入路径（clickhouse-lab 实验 03、12）</p>
+<p style="position:absolute;right:128px;bottom:64px;width:120px;text-align:right;font-size:24px;color:#6B7480">05</p>
+<aside class="notes">Keeper 只存元数据不存数据。一个块只在写入的那个副本上记 NewPart，另外两个记 DownloadPart，后面数建块速率时三个副本可以直接相加。Keeper 停掉，副本立刻只读、写入全停；Keeper 卡住，INSERT 卡在提交那一步，客户端超时放弃，Keeper 回来后服务端照样提交，这正是重复行的起点，运维那一段会再讲。</aside>
+</section>
+<section id="query-path" data-transition="fade" style="background:#F6F4EE;color:#1A2433;font-family:'Noto Sans SC', Arial, sans-serif;padding:128px 128px 160px;display:flex;flex-direction:column;gap:28px">
+<h2 style="font-size:60px;font-weight:700;line-height:1.15">查明细时按四层跳过数据，再只读用到的列</h2>
+<div style="display:flex;gap:32px">
+<div style="width:840px;display:flex;flex-direction:column;gap:20px">
+<div style="display:flex;flex-direction:column;gap:10px;align-items:center">
+<div style="width:840px;background:#1F6E9C;border-radius:10px;padding:16px 24px"><p style="font-size:24px;line-height:1.4;color:#F2EFE7"><b>分区</b>：条件里带分区键或 _partition_id，别的日分区整个跳过</p></div>
+<div style="width:760px;background:#2A7FB0;border-radius:10px;padding:16px 24px"><p style="font-size:24px;line-height:1.4;color:#F2EFE7"><b>part 的最值</b>：settle_ms 范围对不上的 part 整个跳过</p></div>
+<div style="width:680px;background:#3B90C2;border-radius:10px;padding:16px 24px"><p style="font-size:24px;line-height:1.4;color:#F2EFE7"><b>稀疏主键</b>：每 8192 行一条，只读命中的 granule</p></div>
+<div style="width:600px;background:#7FBBDD;border-radius:10px;padding:16px 24px"><p style="font-size:24px;line-height:1.4;color:#0F1B2D"><b>跳数索引</b>：minmax 和 bloom_filter 再筛一遍</p></div>
+<div style="width:520px;background:#E8A33D;border-radius:10px;padding:16px 24px"><p style="font-size:24px;line-height:1.4;color:#0F1B2D"><b>只读用到的列</b>，整块解压后按列计算</p></div>
+</div>
+<p style="font-size:24px;line-height:1.5;color:#3B4656">命中的 granule 怎么在文件里找到：每列一个 mark 文件，记着这个 granule 在哪个压缩块、块里的什么位置。位置不放进主键索引，索引才小到能常驻内存，用不到的列也不用读它的 mark。</p>
+<p style="font-size:24px;line-height:1.5;color:#3B4656">这张表 PRIMARY KEY (settle_ms, id) 只取了排序键的前缀，rev 只影响同一个 (settle_ms, id) 内部的顺序。</p>
+</div>
+<div style="flex:1;display:flex;flex-direction:column;gap:16px">
+<div style="background:#0F1B2D;border-radius:16px;padding:24px 28px;display:flex;flex-direction:column;gap:6px">
+<p style="font-size:72px;font-weight:700;line-height:1;color:#E8A33D">344,064 行</p>
+<p style="font-size:24px;line-height:1.4;color:#C9D3DF">lab 实验 14：一千万行、14 个 part 的表，按排序键查 50 秒的数据，命中 6 个 part × 7 个 granule，一千万多行里只读了这些。</p>
+</div>
+<div style="background:#FDFCF9;border:1px solid #D9D3C4;border-radius:16px;padding:20px 28px">
+<p style="font-size:24px;line-height:1.45;color:#3B4656"><b>主键对排序键的第一列最有效。</b>这张表以毫秒时间戳 settle_ms 开头，按时间范围查最省；只按 id 单查，前一列基数太高排除不掉 granule，要靠 bloom filter，或者带上时间范围。</p>
+</div>
+<div style="background:#FDFCF9;border:1px solid #D9D3C4;border-radius:16px;padding:20px 28px">
+<p style="font-size:24px;line-height:1.45;color:#3B4656"><b>跳数索引只在值不散在每一段里时有效。</b>id 每行不同，bloom filter 跳得动；tenant_id、currency_id 这类低基数、分布偏斜的维度列，大租户几乎每段都出现，很难跳过什么。</p>
+</div>
+<div style="background:#FDFCF9;border:1px solid #D9D3C4;border-radius:16px;padding:20px 28px">
+<p style="font-size:24px;line-height:1.45;color:#3B4656"><b>查得好不好怎么看：</b>EXPLAIN indexes = 1 逐层列出裁掉多少；query_log 里 read_rows 和 result_rows 的比值，读了几百万行只返回几行就是前面几层没起作用。</p>
+</div>
+</div>
+</div>
+<p style="position:absolute;left:128px;bottom:64px;font-size:24px;color:#6B7480">基本原理 · 出处：ClickHouse 的查询路径和 FINAL 的代价（clickhouse-lab 实验 14）</p>
+<p style="position:absolute;right:128px;bottom:64px;width:120px;text-align:right;font-size:24px;color:#6B7480">06</p>
+<aside class="notes">思路只有一条：尽量不读不需要的数据。最粗的是分区，然后是 part 目录里存的分区列最值，然后是稀疏主键按 granule 跳，最后跳数索引再筛一遍；跳完只读用到的列，34 列的宽表按时间求金额合计只碰两列。不带条件的 count() 连数据都不读，直接读 part 里记的行数，read_rows 是 1；带上 FINAL 之后这个快捷路径就没了，讲明细查询那页会看到。</aside>
+</section>
+<section id="sink-path" data-transition="fade" style="background:#F6F4EE;color:#1A2433;font-family:'Noto Sans SC', Arial, sans-serif;padding:128px 128px 160px;display:flex;flex-direction:column;gap:28px">
+<h2 style="font-size:60px;font-weight:700;line-height:1.15">sink 每次 poll 按 Kafka 分区各发一条 INSERT，至少一次投递</h2>
+<div style="display:flex;gap:32px">
+<div style="width:760px;display:flex;flex-direction:column;gap:10px">
+<div style="background:#FDFCF9;border:1px solid #D9D3C4;border-radius:12px;padding:18px 24px;display:flex;flex-direction:column;gap:10px">
+<p style="font-size:24px;line-height:1.4;font-weight:700">Kafka topic，8 个分区</p>
+<div style="display:flex;gap:8px">
+<p style="flex:1;font-size:24px;text-align:center;background:#ECE8DD;border-radius:8px;padding:6px 0px">P0</p>
+<p style="flex:1;font-size:24px;text-align:center;background:#ECE8DD;border-radius:8px;padding:6px 0px">P1</p>
+<p style="flex:1;font-size:24px;text-align:center;background:#ECE8DD;border-radius:8px;padding:6px 0px">P2</p>
+<p style="flex:1;font-size:24px;text-align:center;background:#ECE8DD;border-radius:8px;padding:6px 0px">P3</p>
+<p style="flex:1;font-size:24px;text-align:center;background:#ECE8DD;border-radius:8px;padding:6px 0px">P4</p>
+<p style="flex:1;font-size:24px;text-align:center;background:#ECE8DD;border-radius:8px;padding:6px 0px">P5</p>
+<p style="flex:1;font-size:24px;text-align:center;background:#ECE8DD;border-radius:8px;padding:6px 0px">P6</p>
+<p style="flex:1;font-size:24px;text-align:center;background:#ECE8DD;border-radius:8px;padding:6px 0px">P7</p>
+</div>
+</div>
+<x-shape kind="arrow-down" style="width:22px;height:32px;background:#E8A33D;align-self:center"></x-shape>
+<div style="background:#FDFCF9;border:1px solid #D9D3C4;border-radius:12px;padding:18px 24px">
+<p style="font-size:24px;line-height:1.4"><b>一次 poll</b>（最多 500 条）把记录按 topic-partition 分组</p>
+</div>
+<x-shape kind="arrow-down" style="width:22px;height:32px;background:#E8A33D;align-self:center"></x-shape>
+<div style="background:#FDFCF9;border:1px solid #D9D3C4;border-radius:12px;padding:18px 24px">
+<p style="font-size:24px;line-height:1.4"><b>最多 8 条 INSERT，每条带一个 token</b>：insert_deduplication_token = topic-partition-minOffset-maxOffset。同步插入，一条十几到几十行。</p>
+</div>
+<x-shape kind="arrow-down" style="width:22px;height:32px;background:#E8A33D;align-self:center"></x-shape>
+<div style="background:#0F1B2D;border-radius:12px;padding:18px 24px">
+<p style="font-size:24px;line-height:1.4;color:#F2EFE7"><b>ClickHouse</b>：连接随机落到一个副本；服务端按 token（没有 token 时按块哈希）做块级去重，认出来的重复块直接跳过。</p>
+</div>
+<p style="font-size:24px;line-height:1.45;color:#3B4656">B 档一天约 2.05 亿行，峰值每秒约 1 万条；offset 默认每 60 秒提交一次。</p>
+</div>
+<div style="flex:1;display:flex;flex-direction:column;gap:16px">
+<p style="font-size:24px;font-weight:700;letter-spacing:2px;color:#9A6212">超时和重投怎么发生（按 v1.3.9 源码和 Kafka 3.7 的 WorkerSinkTask）</p>
+<div style="background:#FDFCF9;border:1px solid #D9D3C4;border-radius:16px;padding:20px 28px">
+<p style="font-size:24px;line-height:1.45;color:#3B4656"><b>INSERT 外面没有重试循环。</b>插件的 retryCount 只管 ping 和 query；写超时被包成 RetriableException 交给框架，由框架重投。</p>
+</div>
+<div style="background:#FDFCF9;border:1px solid #D9D3C4;border-radius:16px;padding:20px 28px">
+<p style="font-size:24px;line-height:1.45;color:#3B4656"><b>30 秒是 clickhouse-java V1 client 的默认 socket_timeout</b>，不是插件的 timeoutSeconds（那只管 ping）。想改它，配置里唯一能碰到的键是 jdbcConnectionProperties。</p>
+</div>
+<div style="background:#FDFCF9;border:1px solid #D9D3C4;border-radius:16px;padding:20px 28px">
+<p style="font-size:24px;line-height:1.45;color:#3B4656"><b>重投要等到下一个 offset 提交点</b>，最长 offset.flush.interval.ms = 60 秒。所以一轮失败写出的两份，间隔落在 (30, 90] 秒；现有集群见过的 124 秒是两轮。</p>
+</div>
+<div style="background:#FDFCF9;border:1px solid #D9D3C4;border-radius:16px;padding:20px 28px">
+<p style="font-size:24px;line-height:1.45;color:#3B4656"><b>重投的是内存里保留的同一批</b>：记录、顺序、边界、token 都和第一次一样。能不能被认出来，全看服务端的去重窗口还记不记得它。</p>
+</div>
+</div>
+</div>
+<p style="position:absolute;left:128px;bottom:64px;font-size:24px;color:#6B7480">Kafka sink · 出处：ClickHouse 里的重复行来自 Kafka Connect 超时重投</p>
+<p style="position:absolute;right:128px;bottom:64px;width:120px;text-align:right;font-size:24px;color:#6B7480">07</p>
+<aside class="notes">Kafka Connect 是 at-least-once 的：put() 抛 RetriableException，框架不丢这批、也不回 Kafka 重拉，而是暂停所有分区，把手里那批原样再交一次。下游写入不是幂等的就会写第二份。另外一点：一次 poll 里某一组写超时，异常直接从 put() 抛出去，后面的分组这一轮不再写；下一轮整次 poll 重投，已经写成功的几组带着同样的 token 再写一遍，窗口在就被拦下，窗口没了一次超时就可能在好几个分区上带出重复。</aside>
+</section>
+<section id="dup-sources" data-transition="fade" style="background:#F6F4EE;color:#1A2433;font-family:'Noto Sans SC', Arial, sans-serif;padding:128px 128px 160px;display:flex;flex-direction:column;gap:24px">
+<h2 style="font-size:60px;font-weight:700;line-height:1.15">重复行的四个入口，以及块级去重窗口为什么拦不住</h2>
+<table style="font-size:24px;line-height:1.4;color:#1A2433">
+<tr style="background:#ECE8DD"><th style="width:14%;text-align:left">入口</th><th style="width:38%;text-align:left">怎么产生</th><th style="width:24%;text-align:left">见过的情形</th><th style="width:24%;text-align:left">sink 的 exactlyOnce 挡得住吗</th></tr>
+<tr><td>producer 重试</td><td>请求其实写进了 broker，应答在抖动里丢了，重试又写一份；topic 里是两条 offset 不同的记录</td><td>现有集群：一个 45 分钟窗口多出一百多行，每个键正好两份</td><td>挡不住：对 connector 来说都是新数据</td></tr>
+<tr><td>sink 超时重投</td><td>INSERT 过了 30 秒 client 超时，但服务端已经提交；框架把同一批原样再交一次</td><td>现有集群：234 行，写入间隔 32 到 124 秒</td><td>挡不住：状态停在 BEFORE_PROCESSING，原样重插，仍靠去重窗口</td></tr>
+<tr><td>task 重启重放</td><td>重启前没来得及提交 offset，接替的 task 从上一个提交点重读，批次边界会变</td><td>lab 实验 21 造过</td><td>挡得住；但默认配置下崩溃重启常停在 State MISMATCH</td></tr>
+<tr><td>人工补发</td><td>发送超时的记录先存进重试表，事后补发时其中一部分其实早已写进去</td><td>补发前先按键查了 ClickHouse，没补出新的重复</td><td>挡不住：补发前按键查</td></tr>
+</table>
+<div style="display:flex;gap:24px">
+<div style="flex:1;background:#0F1B2D;border-radius:16px;padding:22px 28px;display:flex;flex-direction:column;gap:6px">
+<p style="font-size:56px;font-weight:700;line-height:1;color:#E8A33D">1000 个块</p>
+<p style="font-size:24px;line-height:1.4;color:#C9D3DF">25.3 默认的 replicated_deduplication_window：Keeper 只记最近 1000 个插入块的 token 或哈希，按块数算，不按时间</p>
+</div>
+<div style="flex:1;background:#0F1B2D;border-radius:16px;padding:22px 28px;display:flex;flex-direction:column;gap:6px">
+<p style="font-size:56px;font-weight:700;line-height:1;color:#E8A33D">124 块/s</p>
+<p style="font-size:24px;line-height:1.4;color:#C9D3DF">B 档三副本合计的建块速率，从 part_log 里 error = 0 的 NewPart 数出来；C 档约 40 块/s</p>
+</div>
+<div style="flex:1;background:#0F1B2D;border-radius:16px;padding:22px 28px;display:flex;flex-direction:column;gap:6px">
+<p style="font-size:56px;font-weight:700;line-height:1;color:#E8A33D">8 秒 &lt; 32–124 秒</p>
+<p style="font-size:24px;line-height:1.4;color:#C9D3DF">1000 ÷ 124 ≈ 8 秒就把那批挤出窗口，而重投最快也要 32 秒才来。token 和内容都没变，输在记不住</p>
+</div>
+</div>
+<p style="position:absolute;left:128px;bottom:64px;font-size:24px;color:#6B7480">Kafka sink · 出处：重复行的四个入口和 sink exactlyOnce 的覆盖范围；ClickHouse 的块级去重窗口</p>
+<p style="position:absolute;right:128px;bottom:64px;width:120px;text-align:right;font-size:24px;color:#6B7480">08</p>
+<aside class="notes">清理手段对四个入口都一样，能不能从源头挡住各不相同。块级去重本来就是为超时重发设计的，这次没拦住只有一个原因：窗口按块数算，这张表建块太快。上游在 25.9 把默认值提到 10000，Aiven 上要升到 26.3 才拿得到，按 124 块/s 折合 80 秒，234 组里还会剩 182 组。被窗口拦下的插入在 part_log 里记成 error = 389，单独数它可以做告警基线。</aside>
+</section>
+<section id="dedup-plan" data-transition="fade" style="background:#F6F4EE;color:#1A2433;font-family:'Noto Sans SC', Arial, sans-serif;padding:128px 128px 160px;display:flex;flex-direction:column;gap:24px">
+<div style="display:flex;gap:20px;align-items:center">
+<h2 style="font-size:60px;font-weight:700;line-height:1.15">去重方案：接受至少一次，存储层按业务键折叠</h2>
+<p style="font-size:24px;font-weight:700;color:#F2EFE7;background:#1F6E9C;border-radius:999px;padding:4px 16px">方案 · lab 验过，未上线</p>
+</div>
+<table style="font-size:24px;line-height:1.4;color:#1A2433">
+<tr style="background:#ECE8DD"><th style="width:12%;text-align:left">层</th><th style="width:40%;text-align:left">做法</th><th style="width:16%;text-align:left">sink 超时重投</th><th style="width:16%;text-align:left">task 重启重放</th><th style="width:16%;text-align:left">producer 重试</th></tr>
+<tr><td>入口</td><td>块级去重窗口调大（B 档 2 万、C 档 1 万，按建块速率 × 最长重投间隔算）；核实 producer 幂等</td><td>窗口够大就拦得住</td><td>拦不住，token 变了</td><td>幂等只防会话内重试，超时后应用再发的防不住</td></tr>
+<tr style="background:#FBF3E2"><td>存储加查询</td><td>明细表换成 ReplicatedReplacingMergeTree(create_time)，键不变 (settle_ms, id, rev)，读带 FINAL 或 profile 设 final = 1</td><td>能</td><td>能</td><td>能</td></tr>
+<tr><td>派生数据</td><td>sink 的写入带 deduplicate_blocks_in_dependent_materialized_views = 1；报表按天对账、从明细 FINAL 重算</td><td>物化视图去重能拦</td><td>只能靠重算</td><td>只能靠重算</td></tr>
+<tr><td>修复</td><td>已经落库的重复，用快照加 REPLACE PARTITION 的 runbook 清</td><td>事后清</td><td>事后清</td><td>事后清</td></tr>
+</table>
+<div style="display:flex;gap:24px">
+<div style="flex:1;background:#FDFCF9;border:1px solid #D9D3C4;border-radius:16px;padding:20px 28px;display:flex;flex-direction:column;gap:8px">
+<h3 style="font-size:28px;font-weight:600;line-height:1.3">为什么不开 sink 的 exactlyOnce</h3>
+<p style="font-size:24px;line-height:1.45;color:#3B4656">lab 用真的 Connect 测过：它挡得住批次边界变了的重放，挡不住同一批原样重投；打开后崩溃重启默认停在 State MISMATCH，只开 errors.tolerance=all 不配 DLQ 还会丢一段。根子是 ClickHouse 不能把 offset 和数据放进同一个事务提交。</p>
+</div>
+<div style="flex:1;background:#FDFCF9;border:1px solid #D9D3C4;border-radius:16px;padding:20px 28px;display:flex;flex-direction:column;gap:8px">
+<h3 style="font-size:28px;font-weight:600;line-height:1.3">要业务拍板的一件事</h3>
+<p style="font-size:24px;line-height:1.45;color:#3B4656">报表金额只能做到最终一致：窗口外的重复会先让报表多算，等对账、重算之后才改回来。要求任何时刻都不能多算，就得走写入前去重（OpenMeter 那种自写消费端加 Redis 去重），这个方案没有设计这一条。</p>
+</div>
+</div>
+<p style="position:absolute;left:128px;bottom:64px;font-size:24px;color:#6B7480">Kafka sink · 出处：ClickHouse 明细表的去重方案（clickhouse-lab 实验 14、21、23、24、25、27）</p>
+<p style="position:absolute;right:128px;bottom:64px;width:120px;text-align:right;font-size:24px;color:#6B7480">09</p>
+<aside class="notes">只有按键折叠那一层同时管住三种重复，所以它是方案的主体，入口那几层是尽力而为的第一道过滤。三种重复都是除 create_time 外整行相同，排序键相同，合并时折成一行；留下的是后到的那一份。调大窗口的代价在 Keeper，事故那几小时 Keeper 正在积压，所以不能只靠它。实施顺序：先只读核对现状（下游聚合是物化视图还是定时作业、窗口有没有改过），再做低成本的（物化视图跟着去重、核实幂等、对账告警、调窗口），最后换引擎和报表重算一起做，历史重复用 runbook 清。</aside>
+</section>
+<section id="detail-query" data-transition="fade" style="background:#F6F4EE;color:#1A2433;font-family:'Noto Sans SC', Arial, sans-serif;padding:128px 128px 160px;display:flex;flex-direction:column;gap:24px">
+<h2 style="font-size:60px;font-weight:700;line-height:1.15">backoffice 明细查询：怎么写才走索引，FINAL 要付多少</h2>
+<div style="display:flex;gap:32px">
+<div style="width:800px;display:flex;flex-direction:column;gap:14px">
+<div style="background:#0F1B2D;border-radius:16px;padding:24px 28px;display:flex;flex-direction:column;gap:2px;font-family:'JetBrains Mono', 'Courier New', monospace">
+<p style="font-size:24px;line-height:1.45;color:#F2EFE7">SELECT id, settle_ms, amount, status</p>
+<p style="font-size:24px;line-height:1.45;color:#F2EFE7">FROM events FINAL</p>
+<p style="font-size:24px;line-height:1.45;color:#E8A33D">WHERE _partition_id = '20260310'</p>
+<p style="font-size:24px;line-height:1.45;color:#E8A33D">  AND settle_ms &gt;= {from_ms}</p>
+<p style="font-size:24px;line-height:1.45;color:#E8A33D">  AND settle_ms &lt;  {to_ms}</p>
+<p style="font-size:24px;line-height:1.45;color:#F2EFE7">  AND tenant_id = {tenant}</p>
+<p style="font-size:24px;line-height:1.45;color:#F2EFE7">ORDER BY settle_ms LIMIT 200</p>
+</div>
+<p style="font-size:24px;line-height:1.4;color:#6B7480">示意写法。FINAL 只在明细表换成 ReplacingMergeTree 之后才需要；现有集群的表还是 ReplicatedMergeTree。</p>
+<p style="font-size:24px;line-height:1.45;color:#3B4656"><b>1.</b> _partition_id 把日分区写死，settle_ms 范围是排序键首列，主键索引靠它在这一天里跳 granule；去掉它就要把整个日分区扫一遍。</p>
+<p style="font-size:24px;line-height:1.45;color:#3B4656"><b>2.</b> 只按 id 查单笔，靠 id 上的 bloom filter；最好让调用方同时带上结算时间范围。tenant_id 这类低基数条件基本跳不掉数据。</p>
+<p style="font-size:24px;line-height:1.45;color:#3B4656"><b>3.</b> 大范围反复扫的报表类查询，改读增量聚合好的报表表，别每次对明细带 FINAL 现算。</p>
+</div>
+<div style="flex:1;display:flex;flex-direction:column;gap:12px">
+<p style="font-size:24px;font-weight:700;letter-spacing:2px;color:#9A6212">FINAL 的代价（lab 实验 14：一千万行窄表混进 50 万行重投，停掉 merge，M2 Pro）</p>
+<table style="font-size:24px;line-height:1.4;color:#1A2433">
+<tr style="background:#ECE8DD"><th style="width:34%;text-align:left">查询</th><th style="width:33%;text-align:left">不带 FINAL</th><th style="width:33%;text-align:left">带 FINAL</th></tr>
+<tr><td>count()</td><td>1 ms，读 1 行</td><td>12 ms，读 1080 万行</td></tr>
+<tr><td>按排序键查一个范围</td><td>4 ms，读 34.4 万行</td><td>9 ms，读 49.2 万行</td></tr>
+</table>
+<p style="font-size:24px;font-weight:700;letter-spacing:2px;color:#9A6212">和查询里手写去重比（重叠集中在前 10 万个键的那张表）</p>
+<table style="font-size:24px;line-height:1.4;color:#1A2433">
+<tr style="background:#ECE8DD"><th style="width:40%;text-align:left">去重方式</th><th style="width:30%;text-align:left">耗时</th><th style="width:30%;text-align:left">内存</th></tr>
+<tr style="background:#FBF3E2"><td>FINAL</td><td>27 ms</td><td>17.13 MiB</td></tr>
+<tr><td>手写 GROUP BY</td><td>169 ms</td><td>1.01 GiB</td></tr>
+<tr><td>手写 LIMIT 1 BY</td><td>1287 ms</td><td>1.15 GiB</td></tr>
+</table>
+<p style="font-size:24px;line-height:1.45;color:#3B4656">FINAL 只归并互相重叠的键区间，代价跟着重叠范围走；按时间排序、只重投最近数据的表，重叠天然集中，落在便宜的一头。绝对耗时带不到现有集群，倍数关系也要在两三亿行的宽表上再测。</p>
+</div>
+</div>
+<p style="position:absolute;left:128px;bottom:64px;font-size:24px;color:#6B7480">Kafka sink · 出处：ClickHouse 的查询路径和 FINAL 的代价（clickhouse-lab 实验 14）</p>
+<p style="position:absolute;right:128px;bottom:64px;width:120px;text-align:right;font-size:24px;color:#6B7480">10</p>
+<aside class="notes">「FINAL 太贵别用」要分清跟谁比：跟不去重比它确实贵，count() 失去元数据快捷路径，范围查询耗时翻一倍、多读四成行；跟自己在查询里手写 GROUP BY 去重比，它便宜得多，内存差一个数量级以上，因为每个 part 本来就按排序键有序，FINAL 做的是流式归并。官方去重策略页对大数据量上的 FINAL 持保留态度，到两三亿行上谁更省要再测一次。</aside>
+</section>
+<section id="report-mv" data-transition="fade" style="background:#F6F4EE;color:#1A2433;font-family:'Noto Sans SC', Arial, sans-serif;padding:128px 128px 160px;display:flex;flex-direction:column;gap:24px">
+<div style="display:flex;gap:20px;align-items:center">
+<h2 style="font-size:60px;font-weight:700;line-height:1.15">报表：物化视图在插入时把明细聚合进半小时桶</h2>
+<p style="font-size:24px;font-weight:700;color:#F2EFE7;background:#1F6E9C;border-radius:999px;padding:4px 16px">方案 · lab 验过，未上线</p>
+</div>
+<div style="display:flex;gap:20px">
+<div style="flex:1;background:#FDFCF9;border:1px solid #D9D3C4;border-radius:16px;padding:24px 28px;display:flex;flex-direction:column;gap:10px">
+<h3 style="font-size:30px;font-weight:600;line-height:1.3">明细表</h3>
+<p style="font-size:24px;line-height:1.45;color:#3B4656">ReplicatedReplacingMergeTree(create_time)，按结算日分区，键不变。</p>
+</div>
+<x-shape kind="arrow-right" style="width:56px;height:28px;background:#E8A33D;align-self:center"></x-shape>
+<div style="flex:1;background:#FDFCF9;border:1px solid #D9D3C4;border-radius:16px;padding:24px 28px;display:flex;flex-direction:column;gap:10px">
+<h3 style="font-size:30px;font-weight:600;line-height:1.3">物化视图</h3>
+<p style="font-size:24px;line-height:1.45;color:#3B4656">插入时的触发器：只看这一次新插入的块，看不到之后的合并、mutation 和删除。代价和写入量成正比。</p>
+</div>
+<x-shape kind="arrow-right" style="width:56px;height:28px;background:#E8A33D;align-self:center"></x-shape>
+<div style="flex:1;background:#FDFCF9;border:1px solid #D9D3C4;border-radius:16px;padding:24px 28px;display:flex;flex-direction:column;gap:10px">
+<h3 style="font-size:30px;font-weight:600;line-height:1.3">报表表</h3>
+<p style="font-size:24px;line-height:1.45;color:#3B4656">ReplicatedAggregatingMergeTree；UTC 30 分钟桶 × 维度，按天分区，和明细的日分区一一对应，修一天只换一个分区。</p>
+</div>
+<x-shape kind="arrow-right" style="width:56px;height:28px;background:#E8A33D;align-self:center"></x-shape>
+<div style="flex:1;background:#0F1B2D;border-radius:16px;padding:24px 28px;display:flex;flex-direction:column;gap:10px">
+<h3 style="font-size:30px;font-weight:600;line-height:1.3;color:#E8A33D">查询时按时区上卷</h3>
+<p style="font-size:24px;line-height:1.45;color:#C9D3DF">toDate(bucket, 'Asia/Shanghai')：日报、周报、月报都从 30 分钟桶现算，读时一律带 GROUP BY 再聚合一遍。</p>
+</div>
+</div>
+<div style="display:flex;gap:32px">
+<div style="width:620px;display:flex;flex-direction:column;gap:12px">
+<p style="font-size:24px;font-weight:700;letter-spacing:2px;color:#9A6212">同一张上海时区的日报，三天全读（lab）</p>
+<div style="background:#FBF3E2;border:1px solid #E8A33D;border-radius:16px;padding:18px 24px;display:flex;flex-direction:column;gap:4px">
+<p style="font-size:44px;font-weight:700;line-height:1.1;color:#9A6212">3,275 行 · 2 ms · 4.04 MiB</p>
+<p style="font-size:24px;line-height:1.4;color:#3B4656">读报表表：行数 = 桶数 × 当天的维度组合数，不跟着明细涨</p>
+</div>
+<div style="background:#FDFCF9;border:1px solid #D9D3C4;border-radius:16px;padding:18px 24px;display:flex;flex-direction:column;gap:4px">
+<p style="font-size:44px;font-weight:700;line-height:1.1;color:#3B4656">1,175,832 行 · 18 ms · 24.62 MiB</p>
+<p style="font-size:24px;line-height:1.4;color:#3B4656">从明细 FINAL 现算：读整天的明细</p>
+</div>
+</div>
+<div style="flex:1;display:flex;flex-direction:column;gap:12px">
+<p style="font-size:24px;line-height:1.45;color:#3B4656"><b>指标怎么存：</b>可加的用 SimpleAggregateFunction(sum, …)，去重用户数写 uniqExactState、读 uniqExactMerge；不用近似的 uniq，对账口径修不回来。</p>
+<p style="font-size:24px;line-height:1.45;color:#3B4656"><b>桶按业务时间 settle_ms 切、按 UTC 切，不按 create_time：</b>重复的几份落在同一个桶里，明细的一天正好对应报表的一个分区。明细和报表必须按同一个时区切天，每套部署先查 SELECT timezone()。</p>
+<p style="font-size:24px;line-height:1.45;color:#3B4656"><b>时区实测（实验 25）：</b>+8:00、+5:30、−5:00 连夏令时那天都逐天一致；+5:45 的加德满都日界落在桶中间，对不上，要 15 分钟桶，报表行数翻倍。</p>
+</div>
+</div>
+<p style="position:absolute;left:128px;bottom:64px;font-size:24px;color:#6B7480">报表 · 出处：用物化视图做 ClickHouse 交易报表（clickhouse-lab 实验 24、25）</p>
+<p style="position:absolute;right:128px;bottom:64px;width:120px;text-align:right;font-size:24px;color:#6B7480">11</p>
+<aside class="notes">现有集群上的聚合表按写入时间 create_time 的窗口增量累加，不按业务键去重；这页是改过的链路，桶按业务时间切。物化视图显式写 TO 目标表：重算时要往报表表换分区，报表表也能单独 ALTER。报表按天分区三年约一千一百个分区，略超文档建议；改按月分区就要整月重算，这是个取舍。口径从 create_time 换成 settle_ms 之前要先和报表的使用方确认。</aside>
+</section>
+<section id="report-reconcile" data-transition="fade" style="background:#F6F4EE;color:#1A2433;font-family:'Noto Sans SC', Arial, sans-serif;padding:128px 128px 160px;display:flex;flex-direction:column;gap:24px">
+<div style="display:flex;gap:20px;align-items:center">
+<h2 style="font-size:60px;font-weight:700;line-height:1.15">报表会多算的地方，靠对账和重算兜底</h2>
+<p style="font-size:24px;font-weight:700;color:#F2EFE7;background:#1F6E9C;border-radius:999px;padding:4px 16px">方案 · lab 验过，未上线</p>
+</div>
+<div style="display:flex;gap:32px">
+<div style="width:820px;display:flex;flex-direction:column;gap:12px">
+<p style="font-size:24px;font-weight:700;letter-spacing:2px;color:#9A6212">实验 25：三天各 30 万行，逐种注入后看报表偏多少</p>
+<table style="font-size:24px;line-height:1.4;color:#1A2433">
+<tr style="background:#ECE8DD"><th style="width:40%;text-align:left">注入的情形</th><th style="width:16%;text-align:left">明细 FINAL</th><th style="width:18%;text-align:left">报表</th><th style="width:26%;text-align:left">lab 上偏了多少</th></tr>
+<tr><td>sink 超时重投：同一批同一 token，窗口还记得</td><td>对</td><td>对</td><td>不偏</td></tr>
+<tr style="background:#FBF3E2"><td>task 重启重放：边界和 token 都变了</td><td>对</td><td>多算</td><td>700 行，金额 360491.71</td></tr>
+<tr style="background:#FBF3E2"><td>producer 重试：Kafka 里存了两份</td><td>对</td><td>多算</td><td>和下一行合计 130 行，金额 64191.68</td></tr>
+<tr style="background:#FBF3E2"><td>改数据：按 Replacing 惯例重发一条新版本</td><td>新值</td><td>新旧两份都算</td><td>同上</td></tr>
+<tr><td>人工补发的正常迟到数据</td><td>对</td><td>对</td><td>不偏</td></tr>
+</table>
+<p style="font-size:24px;line-height:1.45;color:#3B4656">明细这边按键折叠之后是对的，报表上的偏差只能靠重算改回来；对明细 OPTIMIZE … FINAL 也救不了。</p>
+</div>
+<div style="flex:1;display:flex;flex-direction:column;gap:14px">
+<p style="font-size:24px;line-height:1.45;color:#3B4656"><b>1. 每天对账。</b>报表按桶聚合，和明细 FINAL 按同样的桶现算，FULL JOIN 逐桶比，只输出偏了的天。lab 上准确找出了被注入的那两天，补发过正常迟到数据的那天不在其中。覆盖最近两周，人工补发会写进十几天前的分区。</p>
+<p style="font-size:24px;line-height:1.45;color:#3B4656"><b>2. 重算一天。</b>建临时表；同一会话里 SYNC REPLICA 后从明细 FINAL 重算这一天（max_threads = 2）；查 part_log 过闸，t0 之后这一天在任一副本上不能有新 part；REPLACE PARTITION 带 alter_sync = 2；换完再过一次闸。</p>
+<p style="font-size:24px;line-height:1.45;color:#3B4656"><b>3. 闸不能省。</b>lab 上临时表写好之后迟到 50 行，不过闸直接换，报表反而少了 50 行、金额少 23939.59；过闸拦下、重来一次，前后两批 100 行都在。</p>
+<p style="font-size:24px;line-height:1.45;color:#3B4656"><b>4. 窗口内的重投不多算。</b>所有写入一律带 deduplicate_blocks_in_dependent_materialized_views = 1（25.3 默认 0，26.2 起默认 1）；报表表的窗口不能比明细表小；25.3 上不能和 async_insert 一起开。</p>
+</div>
+</div>
+<p style="position:absolute;left:128px;bottom:64px;font-size:24px;color:#6B7480">报表 · 出处：ClickHouse 报表的对账和重算（clickhouse-lab 实验 24、25、26）</p>
+<p style="position:absolute;right:128px;bottom:64px;width:120px;text-align:right;font-size:24px;color:#6B7480">12</p>
+<aside class="notes">物化视图在插入时就把行累加进报表，之后的合并它看不到，所以明细表折得掉的重复，报表不一定折得掉。重算和写入跑在同一批节点上，实验 26 比过：重算本来就不太并行，限到 2 个线程只慢 6% 到 39%，同节点 sink 小批写入的 p95 从 33 到 69 ms 回到 9 到 19 ms。闸的两个前提：part_log 要开着（现有集群只留 4 天，够一次重算用），sink 正在写的那一天每次都过不了闸，要等过了零点再修。</aside>
+</section>
+<section id="ops-slow-writes" data-transition="fade" style="background:#F6F4EE;color:#1A2433;font-family:'Noto Sans SC', Arial, sans-serif;padding:128px 128px 160px;display:flex;flex-direction:column;gap:24px">
+<h2 style="font-size:60px;font-weight:700;line-height:1.15">写入变慢或被拒：先看 Keeper 和 part 数</h2>
+<table style="font-size:24px;line-height:1.4;color:#1A2433">
+<tr style="background:#ECE8DD"><th style="width:14%;text-align:left">情形</th><th style="width:43%;text-align:left">表现（lab 实验 11、12）</th><th style="width:43%;text-align:left">怎么认、怎么处理</th></tr>
+<tr><td>Keeper 停掉</td><td>副本立刻转只读，读照常；INSERT 按默认参数重试约 143 秒后报 Code 242 TABLE_IS_READ_ONLY；Keeper 回来 2 到 12 秒内自愈，被拒的那几条不会补写。</td><td>写入全停但数据不坏。242 在 connector 可重试的错误码里，这批留在内存等下一个提交点重投，表现是消费组 lag 上涨。</td></tr>
+<tr style="background:#FBF3E2"><td>Keeper 卡住</td><td>约 10 秒后才转只读；客户端 30 秒超时断开；Keeper 回来后服务端把那条 INSERT 照样提交，query_log 里是正常的 QueryFinish。</td><td>更麻烦的一种：客户端以为失败、服务端其实成功，框架接着重投就是重复行的起点。判断一批写没写进去以 part_log 的 NewPart 为准。</td></tr>
+<tr><td>part 过多</td><td>单分区活跃 part 到 1000 开始拖慢（DelayedInserts 计数上涨，lab 里 INSERT 中位耗时 7 ms 变 311 ms），到 3000 报 Code 252 Too many parts；平均 part 超过 1 GiB 的分区不受这道闸管。</td><td>盯 part 数，不盯错误率。常见起因是停了 merge 的迁移实验、一条大 INSERT … SELECT 一次切出几百个 part；merge 放回去、part 合掉，写入马上恢复。</td></tr>
+<tr><td>并发查询到上限</td><td>Aiven 在 profile 里锁了每个节点的并发查询数（A、B、C 档分别 100、375、200），INSERT 也算在内，超出报 Code 202 TOO_MANY_SIMULTANEOUS_QUERIES。</td><td>查询里改设置绕不过去。重算、大范围聚合这类查询限 max_threads，别和 sink 抢；202 同样在可重试列表里，不丢数据。</td></tr>
+</table>
+<p style="font-size:24px;line-height:1.45;color:#3B4656">读一直是好的，只看查询成功率发现不了 Keeper 出事。把超时调长只能让超时少一些：Keeper 卡得比新的超时还久，服务端照样晚到提交、框架照样重投，下游没有按键幂等那一层，重复还是会出现。</p>
+<p style="position:absolute;left:128px;bottom:64px;font-size:24px;color:#6B7480">运维 · 出处：ClickHouse 的 Keeper 故障和 part 过多（clickhouse-lab 实验 11、12）</p>
+<p style="position:absolute;right:128px;bottom:64px;width:120px;text-align:right;font-size:24px;color:#6B7480">13</p>
+<aside class="notes">143 秒是默认重试参数算出来的：insert_keeper_max_retries 20 次，等待从 100 ms 翻倍、封顶 10 秒。lab 的 Keeper 是 ClickHouse Keeper，现有集群每个节点跑的是 ZooKeeper，冻住后约 10 秒才只读来自 ZooKeeper 客户端的 operation_timeout_ms。part 过多那行 lab 把阈值压到 20 和 25 才造出来：第 26 条被拒，之前被拖慢了 5 次。</aside>
+</section>
+<section id="ops-watch" data-transition="fade" style="background:#F6F4EE;color:#1A2433;font-family:'Noto Sans SC', Arial, sans-serif;padding:128px 128px 160px;display:flex;flex-direction:column;gap:24px">
+<h2 style="font-size:60px;font-weight:700;line-height:1.15">平时盯什么：前兆在 Keeper、复制队列和写入耗时尾部</h2>
+<table style="font-size:24px;line-height:1.4;color:#1A2433">
+<tr style="background:#ECE8DD"><th style="width:20%;text-align:left">项</th><th style="width:46%;text-align:left">查法（多副本一律走 clusterAllReplicas）</th><th style="width:34%;text-align:left">线</th></tr>
+<tr><td>单分区活跃 part 数</td><td>system.parts 按库、表、分区数 active 的 part</td><td>到 1000 的一半就处理</td></tr>
+<tr style="background:#FBF3E2"><td>Keeper 在途请求</td><td>system.metrics 的 ZooKeeperRequest（现有集群的 Prometheus 上叫 clickhouse_metrics_zoo_keeper_request）</td><td>现有集群的基线是 5 到 15，涨到几百倍就是停摆的前兆</td></tr>
+<tr><td>复制队列和延迟</td><td>system.replicas 的 queue_size、absolute_delay</td><td>持续高于基线</td></tr>
+<tr style="background:#FBF3E2"><td>INSERT 耗时的尾部</td><td>connector 侧的插入耗时指标，以及 query_log 里 INSERT 的分位数</td><td>到 24 秒（30 秒超时的八成）；另一个 region 已经到 24.4 秒</td></tr>
+<tr><td>副本只读</td><td>system.replicas.is_readonly，告警用窗口内的最大值（max_over_time）</td><td>窗口内最大值为 1；瞬时采样会漏掉只闪一下的只读</td></tr>
+</table>
+<div style="display:flex;gap:24px">
+<div style="flex:1;background:#0F1B2D;border-radius:16px;padding:22px 28px">
+<p style="font-size:24px;line-height:1.45;color:#F2EFE7"><b style="color:#E8A33D">写出重复行的那 3 小时：</b>吞吐看着正常，readonly_replica 瞬时值是 0，只在 30 分钟窗的 max_over_time 里闪了两下；Keeper 在途请求从常态的 5 到 15 涨到 3,415、6,256、2,157、1,748。前一天持续变慢 11 小时、吞吐掉到常态的 7%，反而一行重复都没有。</p>
+</div>
+<div style="width:520px;background:#FBF3E2;border:1px solid #E8A33D;border-radius:16px;padding:22px 28px">
+<p style="font-size:24px;line-height:1.45;color:#1A2433"><b>先做一件事：</b>part_log 和 query_log 现在只留约 4 天，事故之后能查的证据很快就没了。把这两张表的保留期拉长，是所有排查能继续下去的前提。</p>
+</div>
+</div>
+<p style="position:absolute;left:128px;bottom:64px;font-size:24px;color:#6B7480">运维 · 出处：ClickHouse 的 Keeper 故障和 part 过多；重复行来自 Kafka Connect 超时重投</p>
+<p style="position:absolute;right:128px;bottom:64px;width:120px;text-align:right;font-size:24px;color:#6B7480">14</p>
+<aside class="notes">巡检的价值在于有基线，每一项先记常态，超线才有意义。告警不能只看副本只读这类硬故障指标，带 for: 5m 的规则对只闪一下的只读不会响。托管服务下 Keeper 这一层看不见，ZooKeeper 自己的服务端延迟、fsync 耗时都要找 Aiven 要；官方运维建议是 Keeper 和 ClickHouse 分机器或至少分盘，现有集群是每个节点同机跑。</aside>
+</section>
+<section id="ops-missing-wrong" data-transition="fade" style="background:#F6F4EE;color:#1A2433;font-family:'Noto Sans SC', Arial, sans-serif;padding:128px 128px 160px;display:flex;flex-direction:column;gap:24px">
+<h2 style="font-size:60px;font-weight:700;line-height:1.15">数据少了、数字对不上：按链路顺序查</h2>
+<div style="display:flex;gap:32px">
+<div style="flex:1;display:flex;flex-direction:column;gap:10px">
+<p style="font-size:24px;font-weight:700;letter-spacing:2px;color:#9A6212">少了：不报错，往往很久之后才发现</p>
+<p style="font-size:24px;line-height:1.45;color:#3B4656"><b>1.</b> 先对上游和 Kafka 的量，对不上就是 producer 或 broker 的事。</p>
+<p style="font-size:24px;line-height:1.45;color:#3B4656"><b>2.</b> 看 connector 的错误处理配置，坏批次去了哪（下表）。</p>
+<p style="font-size:24px;line-height:1.45;color:#3B4656"><b>3.</b> 看 committed offset 和 log-end offset 的差：一直涨是写不进去，不动是卡住，越过去了就去 DLQ 或源 topic 找。</p>
+<p style="font-size:24px;line-height:1.45;color:#3B4656"><b>4.</b> INSERT 真写进去没有，以 part_log 里 error = 0 的 NewPart 为准；query_log 有两个盲区：晚到提交的可能没有结束记录，被去重拦下的照样记 QueryFinish。</p>
+<p style="font-size:24px;line-height:1.45;color:#3B4656"><b>5.</b> 可能写进了相邻分区：按 _partition_id 在前后几天反查。</p>
+</div>
+<div style="flex:1;display:flex;flex-direction:column;gap:10px">
+<p style="font-size:24px;font-weight:700;letter-spacing:2px;color:#9A6212">不对：行数对得上，金额或人数差一截，全程不报错</p>
+<p style="font-size:24px;line-height:1.45;color:#3B4656"><b>1.</b> 两边比的是不是同一条时间轴：事件时间还是写入时间，按哪个时区切天。UTC 16 点到 24 点的时刻，在 UTC 和上海两种列声明下会落进相邻两天的分区。</p>
+<p style="font-size:24px;line-height:1.45;color:#3B4656"><b>2.</b> JOIN 有没有放大：右表键不唯一，INNER 和 LEFT 都翻倍；ANY 留哪一行由 join_any_take_last_row 定，要确定性就自己 LIMIT 1 BY。</p>
+<p style="font-size:24px;line-height:1.45;color:#3B4656"><b>3.</b> 去重计数是不是 uniq：25.3 上误差两个方向都有，对账只用 uniqExact。</p>
+<p style="font-size:24px;line-height:1.45;color:#3B4656"><b>4.</b> 上游改了字段名：schemaless JSON 不校验，那一列静默变成默认值，按天数 countIf(列 = 0)。</p>
+<p style="font-size:24px;line-height:1.45;color:#3B4656"><b>5.</b> 读 ReplacingMergeTree 带没带 FINAL；<b>6.</b> 报表和明细 FINAL 逐桶对一遍。</p>
+</div>
+</div>
+<table style="font-size:24px;line-height:1.4;color:#1A2433">
+<tr style="background:#ECE8DD"><th style="width:26%;text-align:left">connector 的配置（lab 实验 09）</th><th style="width:40%;text-align:left">一条坏记录进来之后</th><th style="width:34%;text-align:left">少了的数据在哪</th></tr>
+<tr><td>errors.tolerance=none（默认）</td><td>task 约 2 秒后 FAILED，它管的分区不再前进，重启还是停在这条上</td><td>都还在 Kafka 里，信号是 task 状态和消费组 lag</td></tr>
+<tr><td>errors.tolerance=all 加 DLQ</td><td>task 不停；坏记录所在分区的那一整批连同好记录一起进 DLQ</td><td>DLQ topic，补数按整批重放</td></tr>
+<tr style="background:#FBF3E2"><td>errors.tolerance=all 不配 DLQ</td><td>task 不停；那一整批静默消失，offset 照常往前提交</td><td>只剩源 topic 里那一份，task 和 lag 都看不出来，最危险</td></tr>
+</table>
+<p style="position:absolute;left:128px;bottom:64px;font-size:24px;color:#6B7480">运维 · 出处：ClickHouse 数据少了的排查顺序；数字对不上的排查顺序（clickhouse-lab 实验 09、10）</p>
+<p style="position:absolute;right:128px;bottom:64px;width:120px;text-align:right;font-size:24px;color:#6B7480">15</p>
+<aside class="notes">框架自己的 errors.tolerance 只包住转换和 SMT 阶段，put() 里写库失败之后进不进 DLQ 是 connector 自己调 ErrantRecordReporter 决定的，没配 DLQ 时它拿到的是什么都不做的 reporter，所以 errors.tolerance=all 一定要和 DLQ 一起配。右边第一条在现有集群上有一处现成的错位：聚合表按 create_time 切、明细按 settle_ms 分区，跨零点和补发的行两边落在不同的天。</aside>
+</section>
+<section id="ops-fix-data" data-transition="fade" style="background:#F6F4EE;color:#1A2433;font-family:'Noto Sans SC', Arial, sans-serif;padding:128px 128px 160px;display:flex;flex-direction:column;gap:20px">
+<h2 style="font-size:60px;font-weight:700;line-height:1.15">修数据：以分区为单位整体替换，执行前能验、执行后能回滚</h2>
+<div style="display:flex;gap:24px">
+<div style="flex:1;background:#FDFCF9;border:1px solid #D9D3C4;border-radius:16px;padding:22px 26px;display:flex;flex-direction:column;gap:10px">
+<h3 style="font-size:28px;font-weight:600;line-height:1.3">已经落库的重复行：REPLACE PARTITION runbook，R0 到 R8</h3>
+<ul style="font-size:24px;line-height:1.4;color:#3B4656;padding:0px 0px 0px 28px">
+<li>R0 只读检查：三副本当天行数相等、复制队列为空、没有未完成的 mutation</li>
+<li>R1 用 ATTACH PARTITION … FROM 做快照，硬链接，写入 0 行</li>
+<li>R2、R3 从快照找重复键、重建去重后的分区；哈希闸包一层 tuple</li>
+<li>R4 换分区前一刻再数每个副本；R5 REPLACE PARTITION 带 alter_sync = 2</li>
+<li>R6 事后查 part_log：error = 0，上界卡在换分区时刻</li>
+<li>R7 回滚是从快照反向再换一次；快照表留到下游确认后再删</li>
+</ul>
+</div>
+<div style="flex:1;background:#FDFCF9;border:1px solid #D9D3C4;border-radius:16px;padding:22px 26px;display:flex;flex-direction:column;gap:10px">
+<h3 style="font-size:28px;font-weight:600;line-height:1.3">一列写错了 18 天：列级 mutation，带 IN PARTITION</h3>
+<ul style="font-size:24px;line-height:1.4;color:#3B4656;padding:0px 0px 0px 28px">
+<li>ALTER TABLE … UPDATE 列 = 正确值 IN PARTITION … WHERE 谓词，逐分区提交</li>
+<li>856 GiB 的 18 个分区只重写 11 GiB：Wide part 只重写改到的列，其余硬链接；成本从 system.parts_columns 算，不要估</li>
+<li>忘写 IN PARTITION 不报错，但 810 个分区、对象存储上 17.41 TiB 全进队列</li>
+<li>回滚按身份不按状态：补数前先把 id 名单存进表，字面量拼进语句</li>
+<li>验收用 clusterAllReplicas，三个副本都 is_done = 1 才算完</li>
+</ul>
+</div>
+<div style="flex:1;background:#FDFCF9;border:1px solid #D9D3C4;border-radius:16px;padding:22px 26px;display:flex;flex-direction:column;gap:10px">
+<h3 style="font-size:28px;font-weight:600;line-height:1.3">换表引擎：ATTACH 挂历史，EXCHANGE TABLES 切换</h3>
+<ul style="font-size:24px;line-height:1.4;color:#3B4656;padding:0px 0px 0px 28px">
+<li>照旧表建新表（含索引和搬迁 TTL），新表 STOP MERGES，行数闸靠它</li>
+<li>sink 不停，一个分区一个分区 ATTACH PARTITION … FROM，硬链接</li>
+<li>暂停 sink，SYNC REPLICA … LIGHTWEIGHT 排空，按 part_log 找被写过的分区 REPLACE 补齐</li>
+<li>逐副本、逐分区比行数过闸，EXCHANGE TABLES，恢复 sink，START MERGES</li>
+<li>lab 上 sink 只停了 0.34 到 0.50 秒；回滚是同样的路反过来</li>
+</ul>
+</div>
+</div>
+<div style="background:#0F1B2D;border-radius:12px;padding:18px 28px">
+<p style="font-size:24px;line-height:1.45;color:#F2EFE7"><b style="color:#E8A33D">不要这样做：</b>轻量删除不带 IN PARTITION（全表每个 part 都出新版本，两千多个 part 要把窗口读一千遍左右）；OPTIMIZE … FINAL DEDUPLICATE（留哪行由合并定，没有回滚）；多表 RENAME 当原子切换（不原子，用 EXCHANGE）；不排空就切换（正在跑的 INSERT 绑定的是旧表）。</p>
+</div>
+<p style="position:absolute;left:128px;bottom:64px;font-size:24px;color:#6B7480">运维 · 出处：REPLACE PARTITION runbook；用只读权限评审补数方案；在线换引擎（clickhouse-lab 实验 08、18、19、20、27）</p>
+<p style="position:absolute;right:128px;bottom:64px;width:120px;text-align:right;font-size:24px;color:#6B7480">16</p>
+<aside class="notes">三套做法共用一个前提：part 写完不再改，没有 UPSERT。runbook 那几道闸各挡一种情形：副本落后、快照之后的写入、只看一个节点的核对，这三种都会丢行而行数校验照过。补数评审里最贵的问题是回滚谓词：补数会覆盖掉区分「补出来的」和「本来就对的」那一列信息，所以 id 名单要在动手前抓。换引擎切换后新表的块级去重窗口是空的，切换当天要对一次报表的账。这三套都在 lab 上跑通，还没在现有集群上执行。</aside>
+</section>
+<section id="ops-drop-zk" data-transition="fade" style="background:#F6F4EE;color:#1A2433;font-family:'Noto Sans SC', Arial, sans-serif;padding:128px 128px 160px;display:flex;flex-direction:column;gap:24px">
+<h2 style="font-size:60px;font-weight:700;line-height:1.15">两条冷门但致命：误删没有后悔药，ZooKeeper 计数器会用完</h2>
+<div style="display:flex;gap:28px">
+<div style="flex:1;background:#FDFCF9;border:1px solid #D9D3C4;border-radius:16px;padding:22px 26px;display:flex;flex-direction:column;gap:14px">
+<h3 style="font-size:28px;font-weight:600;line-height:1.3">误删表和分区（lab 实验 07、13）</h3>
+<table style="font-size:24px;line-height:1.4;color:#1A2433">
+<tr style="background:#ECE8DD"><th style="width:34%;text-align:left">删法</th><th style="width:33%;text-align:left">上游 25.3 默认</th><th style="width:33%;text-align:left">Aiven 上的现有集群</th></tr>
+<tr><td>DETACH PARTITION</td><td>ATTACH 回来，可逆</td><td>同左，不算删除</td></tr>
+<tr><td>DROP PARTITION</td><td>只能靠事先 FREEZE 的备份</td><td>只有备份</td></tr>
+<tr style="background:#FBF3E2"><td>DROP TABLE 不加 SYNC</td><td>480 秒内能 UNDROP</td><td>宽限期是 0，没有 UNDROP</td></tr>
+<tr><td>DROP TABLE … SYNC</td><td>救不回来</td><td>救不回来</td></tr>
+<tr style="background:#FBF3E2"><td>删超过 50 GB 的表或分区</td><td>报 Code 359 被拦下</td><td>大小保险是 0，不拦</td></tr>
+</table>
+<p style="font-size:24px;line-height:1.45;color:#3B4656">Replicated 库里一条 DROP 删掉三个副本。备份由 Aiven 做，还原是从备份 fork 出一个新服务再切连接，上一次备份之后的数据靠上游重发。所以删之前的确认比删之后的补救重要：runbook 里的工作表、换引擎后的旧表，留到对账和下游确认之后再删，删之前再核一次表名和大小。</p>
+</div>
+<div style="flex:1;background:#FDFCF9;border:1px solid #D9D3C4;border-radius:16px;padding:22px 26px;display:flex;flex-direction:column;gap:10px">
+<h3 style="font-size:28px;font-weight:600;line-height:1.3">ZooKeeper 顺序节点计数器溢出（lab 实验 28）</h3>
+<p style="font-size:24px;line-height:1.45;color:#3B4656">复制表每次 INSERT（每个分区一个 part）和每次 merge，都在 log/ 下建一个顺序节点；序号来自父节点上的 int32 计数器，删日志不减。按每秒 100 个序号约 248 天用完，每秒 1000 个不到 25 天，小批量高频写入的表最先到顶。</p>
+<p style="font-size:24px;line-height:1.45;color:#3B4656"><b>到 2147483647 之后：</b>INSERT 全报 Code 244 UNEXPECTED_ZOOKEEPER_ERROR，Node exists，path 指向 log/log-；merge 分配不出来；读照常；换副本、重启副本都没用。</p>
+<p style="font-size:24px;line-height:1.45;color:#3B4656"><b>怎么确认：</b>system.replicas 的 log_max_index 停在 2147483647。zkCli 里的 cversion 是「计数器 × 2 − 子节点数」，过了 2 的 30 次方会显示成负数，别直接读。</p>
+<p style="font-size:24px;line-height:1.45;color:#3B4656"><b>恢复只用 SQL：</b>照原表建新表（路径带 {uuid}，新路径的 log/ 从 0 起）→ ATTACH PARTITION … FROM 逐分区挂过去 → 各副本核行数 → EXCHANGE TABLES → DROP 坏表 SYNC。到顶期间失败的 INSERT 要由写入方重写。</p>
+<p style="font-size:24px;line-height:1.45;color:#3B4656"><b>预防：</b>攒批或 async_insert 减少写入次数（lab 上 20 次并发同步 INSERT 涨 21，async_insert 只涨 1）；把 log_max_index 加进巡检。</p>
+</div>
+</div>
+<p style="position:absolute;left:128px;bottom:64px;font-size:24px;color:#6B7480">运维 · 出处：ClickHouse 误删表和分区之后的恢复；ZooKeeper 顺序节点计数器溢出导致复制表无法写入</p>
+<p style="position:absolute;right:128px;bottom:64px;width:120px;text-align:right;font-size:24px;color:#6B7480">17</p>
+<aside class="notes">误删那半边，上游默认下 DROP TABLE 不加 SYNC 时 Keeper 里的残留副本和 system.dropped_tables 的条目同时存在、同时消失，看到残留还在就来得及 UNDROP；现有集群两样保险都是 0，这一段只在上游默认下成立。ZooKeeper 那半边是 3.6.0 起的行为：计数器到顶后停住，老版本会变成负数名字。ClickHouse Keeper 的顺序号在 PR #99120 里放宽到了 int64，25.3 里没有。实验 28 是在 Apache ZooKeeper 3.8.4 上做的，和现有集群每个节点跑的 ZooKeeper 同一类。</aside>
+</section>
+<section id="takeaways" data-transition="fade" style="background:#0F1B2D;color:#F2EFE7;font-family:'Noto Sans SC', Arial, sans-serif;padding:128px 128px 160px;display:flex;flex-direction:column;gap:24px">
+<h2 style="font-size:60px;font-weight:700;line-height:1.15;color:#F2EFE7">带走的五条</h2>
+<div style="display:flex;flex-direction:column;gap:14px">
+<div style="display:flex;gap:24px;align-items:center;background:#17273D;border-radius:12px;padding:16px 28px">
+<p style="font-size:40px;font-weight:700;line-height:1;color:#E8A33D;width:56px">1</p>
+<p style="font-size:28px;line-height:1.4;color:#F2EFE7"><b>part 写完不再改，没有 UPSERT。</b>改数据按 part 出新版本，修数据按分区整体替换：执行前能验、执行后能回滚。</p>
+</div>
+<div style="display:flex;gap:24px;align-items:center;background:#17273D;border-radius:12px;padding:16px 28px">
+<p style="font-size:40px;font-weight:700;line-height:1;color:#E8A33D;width:56px">2</p>
+<p style="font-size:28px;line-height:1.4;color:#F2EFE7"><b>这条链路只能做到至少一次。</b>入口的去重窗口是尽力而为，正确性靠存储层按业务键折叠、读带 FINAL（方案）。</p>
+</div>
+<div style="display:flex;gap:24px;align-items:center;background:#17273D;border-radius:12px;padding:16px 28px">
+<p style="font-size:40px;font-weight:700;line-height:1;color:#E8A33D;width:56px">3</p>
+<p style="font-size:28px;line-height:1.4;color:#F2EFE7"><b>物化视图是插入触发器，看不到合并。</b>报表只能最终一致，要能按桶对账、能按天重算，重算要过 part_log 的闸。</p>
+</div>
+<div style="display:flex;gap:24px;align-items:center;background:#17273D;border-radius:12px;padding:16px 28px">
+<p style="font-size:40px;font-weight:700;line-height:1;color:#E8A33D;width:56px">4</p>
+<p style="font-size:28px;line-height:1.4;color:#F2EFE7"><b>三副本多主异步。</b>核对一律 clusterAllReplicas 问遍三个副本，换分区带 alter_sync = 2，一批写没写进去以 part_log 为准。</p>
+</div>
+<div style="display:flex;gap:24px;align-items:center;background:#17273D;border-radius:12px;padding:16px 28px">
+<p style="font-size:40px;font-weight:700;line-height:1;color:#E8A33D;width:56px">5</p>
+<p style="font-size:28px;line-height:1.4;color:#F2EFE7"><b>前兆在 Keeper 在途请求、复制队列和 INSERT 耗时尾部，不在错误率。</b>part_log 和 query_log 只留 4 天，先把保留期拉长。</p>
+</div>
+</div>
+<div style="display:flex;gap:24px">
+<div style="flex:1;border:1px solid #2C3E57;border-radius:12px;padding:16px 24px">
+<p style="font-size:24px;line-height:1.45;color:#C9D3DF"><b style="color:#F2EFE7">现状：</b>ReplicatedMergeTree 明细表，托管 sink 至少一次写入，聚合表按 create_time 的窗口增量累加、不按键去重。</p>
+</div>
+<div style="flex:1;border:1px solid #2C3E57;border-radius:12px;padding:16px 24px">
+<p style="font-size:24px;line-height:1.45;color:#C9D3DF"><b style="color:#7FBBDD">方案（lab 验过，还没在现有集群上执行）：</b>换成 ReplacingMergeTree 加 FINAL、调大去重窗口、物化视图加对账重算、清理和换引擎的 runbook。</p>
+</div>
+</div>
+<p style="position:absolute;left:128px;bottom:64px;font-size:24px;color:#8FA0B3">小结</p>
+<p style="position:absolute;right:128px;bottom:64px;width:120px;text-align:right;font-size:24px;color:#8FA0B3">18</p>
+<aside class="notes">收尾把现状和方案再分一次清楚。要还的债集中在重复行上，方案都在 lab 跑通了，下一步是先只读地核对现有集群：下游聚合是物化视图还是定时作业、sink 的 INSERT 带没带物化视图去重的设置、窗口有没有改过、Aiven 上能不能 MODIFY SETTING，再和报表的使用方定报表金额能不能接受最终一致、桶按 settle_ms 还是 create_time 切。</aside>
+</section>
+<section id="references" data-transition="fade" style="background:#F6F4EE;color:#1A2433;font-family:'Noto Sans SC', Arial, sans-serif;padding:128px 128px 160px;display:flex;flex-direction:column;gap:24px">
+<h2 style="font-size:60px;font-weight:700;line-height:1.15">参考资料</h2>
+<div style="display:flex;gap:40px">
+<div style="flex:1;display:flex;flex-direction:column;gap:8px">
+<p style="font-size:24px;font-weight:700;letter-spacing:2px;color:#9A6212">博客 ClickHouse 系列，按架构篇末尾的阅读顺序</p>
+<p style="font-size:24px;line-height:1.45;color:#1A2433;font-weight:700">存和查</p>
+<p style="font-size:24px;line-height:1.45;color:#3B4656">ClickHouse 交易明细系统的整体架构 · ClickHouse 的写入路径 · ClickHouse 的查询路径和 FINAL 的代价</p>
+<p style="font-size:24px;line-height:1.45;color:#1A2433;font-weight:700">报表</p>
+<p style="font-size:24px;line-height:1.45;color:#3B4656">用物化视图做 ClickHouse 交易报表 · ClickHouse 报表的对账和重算</p>
+<p style="font-size:24px;line-height:1.45;color:#1A2433;font-weight:700">重复行，从哪来、怎么防</p>
+<p style="font-size:24px;line-height:1.45;color:#3B4656">ClickHouse 里的重复行来自 Kafka Connect 超时重投 · ClickHouse 的块级去重窗口 · ClickHouse 重复行的四个入口和 sink exactlyOnce 的覆盖范围 · ClickHouse 明细表的去重方案 · 在线把明细表换成 ReplicatedReplacingMergeTree</p>
+</div>
+<div style="flex:1;display:flex;flex-direction:column;gap:8px">
+<p style="font-size:24px;font-weight:700;letter-spacing:2px;color:#9A6212">&#160;</p>
+<p style="font-size:24px;line-height:1.45;color:#1A2433;font-weight:700">重复行，已经写进去了</p>
+<p style="font-size:24px;line-height:1.45;color:#3B4656">清理 ClickHouse 重复行的 REPLACE PARTITION runbook · 清理 ClickHouse 重复行时行数校验拦不住的情形 · ClickHouse 轻量删除清重复行的代价 · 用只读权限评审 ClickHouse 补数方案</p>
+<p style="font-size:24px;line-height:1.45;color:#1A2433;font-weight:700">其他异常</p>
+<p style="font-size:24px;line-height:1.45;color:#3B4656">ClickHouse 数据少了的排查顺序 · ClickHouse 数字对不上的排查顺序 · ClickHouse 的 Keeper 故障和 part 过多 · ClickHouse 误删表和分区之后的恢复 · ZooKeeper 顺序节点计数器溢出导致 ClickHouse 复制表无法写入</p>
+</div>
+</div>
+<div style="background:#0F1B2D;border-radius:16px;padding:22px 28px;display:flex;flex-direction:column;gap:8px">
+<p style="font-size:24px;line-height:1.45;color:#F2EFE7"><b style="color:#E8A33D">clickhouse-lab</b>（github.com/meirongdev/clickhouse-lab）：ClickHouse 25.3.14.14 三副本加 Kafka 3.7.0 和 connector v1.3.9 的本地实验台，experiments/ 下的脚本各自带断言，results/ 是实跑输出；本 deck 里标「实验 NN」的数字都出自这里。它能验机制，验不了真实量级、对象存储和托管层的行为。</p>
+<p style="font-size:24px;line-height:1.45;color:#C9D3DF"><b style="color:#F2EFE7">一手资料：</b>ClickHouse 团队 2024 年 VLDB 论文「ClickHouse - Lightning Fast Analytics for Everyone」（存储第 3 章、查询第 4 章）· 官方文档 MergeTree、Replication、Deduplicating inserts on retries、Incremental materialized view、ALTER … PARTITION · ClickHouse Kafka Connect Sink 文档与 v1.3.9 源码、Kafka 3.7 的 WorkerSinkTask · Aiven for ClickHouse 的服务架构、tiered storage、system tables 文档。</p>
+</div>
+<p style="position:absolute;left:128px;bottom:64px;font-size:24px;color:#6B7480">参考</p>
+<p style="position:absolute;right:128px;bottom:64px;width:120px;text-align:right;font-size:24px;color:#6B7480">19</p>
+<aside class="notes">系列文章每一篇都写明了某个结论来自现有集群、lab 还是推断；deck 里的数字按同样的口径标了出处。想系统了解 ClickHouse，先读那篇 2024 年的论文，官方文档里有网页版。</aside>
+</section>
+</div></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/5.1.0/reveal.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/5.1.0/plugin/notes/notes.min.js"></script>
+<script>
+document.querySelectorAll('x-connector').forEach((c, i) => {
+  const NS = 'http://www.w3.org/2000/svg';
+  const host = c.parentElement, cs = getComputedStyle(c);
+  let svg = host.querySelector(':scope > svg.x-conn');
+  if (!svg) {
+    svg = document.createElementNS(NS, 'svg');
+    svg.classList.add('x-conn');
+    svg.setAttribute('style', 'position:absolute;inset:0;width:100%;height:100%;overflow:visible;pointer-events:none');
+    host.appendChild(svg);
+  }
+  const w = parseFloat(cs.borderTopWidth) || 2, color = cs.color;
+  const line = document.createElementNS(NS, 'line');
+  for (const k of ['x1', 'y1', 'x2', 'y2']) line.setAttribute(k, c.getAttribute(k));
+  line.setAttribute('stroke', color);
+  line.setAttribute('stroke-width', w);
+  if (cs.borderTopStyle === 'dashed') line.setAttribute('stroke-dasharray', `${w * 3} ${w * 2}`);
+  if (c.getAttribute('head') === 'end') {
+    const id = 'x-conn-head-' + i, m = document.createElementNS(NS, 'marker');
+    m.setAttribute('id', id);
+    m.setAttribute('viewBox', '0 0 10 10');
+    m.setAttribute('refX', '9');
+    m.setAttribute('refY', '5');
+    m.setAttribute('markerWidth', '5');
+    m.setAttribute('markerHeight', '5');
+    m.setAttribute('orient', 'auto');
+    m.innerHTML = `<path d="M0 0L10 5L0 10z" fill="${color}"/>`;
+    svg.appendChild(m);
+    line.setAttribute('marker-end', `url(#${id})`);
+  }
+  svg.appendChild(line);
+  c.remove();
+});
+function fitBoxes() {
+  document.querySelectorAll('.reveal .slides > section').forEach(s => {
+    const display = s.style.display;
+    s.style.display = 'flex';
+    s.querySelectorAll('div').forEach(box => {
+      if (!box.style.height || box.querySelector('div')) return;
+      const texts = [...box.querySelectorAll('h1, h2, h3, p, li')];
+      texts.forEach(t => {
+        t.dataset.fontSize ??= parseFloat(getComputedStyle(t).fontSize);
+        t.style.fontSize = t.dataset.fontSize + 'px';
+      });
+      for (let k = 0.95; box.scrollHeight > box.clientHeight + 1 && k > 0.59; k -= 0.05)
+        texts.forEach(t => { t.style.fontSize = t.dataset.fontSize * k + 'px'; });
+    });
+    s.style.display = display;
+  });
+}
+// 每页的 section 都是 flex 纵向排版，display 交给 reveal.js 切换时设成 flex
+Reveal.initialize({
+  width: 1920, height: 1080, margin: 0, center: false, display: 'flex',
+  hash: true, plugins: [RevealNotes],
+}).then(fitBoxes);
+// 中文字体按 unicode-range 分片懒加载，字形到齐后重算一遍
+document.fonts.addEventListener('loadingdone', fitBoxes);
+</script>
+</body>
+</html>
