@@ -729,7 +729,8 @@ function fitBoxes() {
 // 每页的 section 都是 flex 纵向排版，display 交给 reveal.js 切换时设成 flex
 Reveal.initialize({
   width: 1920, height: 1080, margin: 0, center: false, display: 'flex',
-  hash: true, plugins: [RevealNotes],
+  // 翻页箭头不随画布缩放，放右下角会在小窗口里压住页脚的页码
+  controlsLayout: 'edges', hash: true, plugins: [RevealNotes],
 }).then(fitBoxes);
 // 中文字体按 unicode-range 分片懒加载，字形到齐后重算一遍
 document.fonts.addEventListener('loadingdone', fitBoxes);
